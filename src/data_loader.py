@@ -49,7 +49,13 @@ def load_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame
             print(f"Info Data Cleaning: Menghapus {jumlah_data_awal - jumlah_data_akhir} baris data (NaN atau Volume 0).")
             print(f"Berhasil memuat {len(df)} baris data bersih untuk {ticker}.")
 
-        return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        
+        # Tambahkan hari ini di baris paling bawah dengan fitur seluruhnya NaN
+        today = pd.Timestamp('today', tz=df.index.tz).normalize()
+        df.loc[today] = float('nan')
+        
+        return df
         
     except Exception as e:
         # Menyediakan error message yang jelas untuk keperluan logging produksi
