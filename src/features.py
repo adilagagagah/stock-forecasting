@@ -99,9 +99,18 @@ def detect_support_resistance(df: pd.DataFrame, window: int = 20) -> pd.DataFram
             df.loc[df.index[i], 'Support'] = resistance_yesterday
 
     # Bersihkan NaN awal dan hapus kolom temporary
+    df['distance_to_support'] = ((df['Open'] - df['Support_Zone_High']) / (df['Support_Zone_High'] + 1e-9)) * 100
+    df['distance_to_resistance'] = ((df['Resistance_Zone_Low'] - df['Open']) / (df['Open'] + 1e-9)) * 100
+    # df['distance_to_support'] = df['Open'] - df['Support_Zone_High']
+    # df['distance_to_resistance'] = df['Resistance_Zone_Low'] - df['Open']
+
+    # Lakukan ffill dan bfill untuk membersihkan NaN jika ada pembagi nol
+    df['distance_to_support'] = df['distance_to_support'].ffill().bfill()
+    df['distance_to_resistance'] = df['distance_to_resistance'].ffill().bfill()
     df['Support'] = df['Support'].ffill().bfill()
     df['Resistance'] = df['Resistance'].ffill().bfill()
-    df.drop(columns=['ATR_temp', 'Raw_Support', 'Raw_Resistance', 'Support', 'Resistance'], inplace=True)
+
+    df.drop(columns=['ATR_temp', 'Raw_Support', 'Raw_Resistance'], inplace=True)
     
     return df
 

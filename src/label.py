@@ -6,6 +6,7 @@ def direction_label(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     """ Menghitung slope tren pergerakan harga Close dari T+0 hingga T+4 """
     df = df.copy()
     x = np.arange(1, window + 1)
+    open_t = df['Open']
     
     def get_slope(y):
         if len(y) < window or np.isnan(y).any():
@@ -13,8 +14,12 @@ def direction_label(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
         slope, _, _, _, _ = linregress(x, y)
         return slope
 
-    # .shift(-(window - 1)) menarik jendela rolling ke depan dimulai dari hari T+0
-    df['trend_slope'] = df['Close'].rolling(window=window).apply(get_slope, raw=True).shift(1-window)
+    # .shift(1-window) menarik jendela rolling ke depan dimulai dari hari T+0
+    norm_close = df['Close'].copy()
+    df['trend_slope'] = norm_close.rolling(window=window).apply(get_slope, raw=True).shift(1-window)
+    # Bagi dengan open_t untuk mendapatkan skala persentase pertumbuhan per hari
+    df['trend_slope'] = df['trend_slope'] / open_t
+
     return df
 
 def return_label(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
@@ -24,6 +29,7 @@ def return_label(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     
     future_high_max = df['High'].rolling(window=window).max().shift(1-window)
     df['return'] = (future_high_max - open_t) / open_t
+
     return df
 
 def risk_label(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
@@ -33,6 +39,7 @@ def risk_label(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     
     future_low_min = df['Low'].rolling(window=window).min().shift(1-window)
     df['risk'] = (future_low_min - open_t) / open_t
+    
     return df
 
 def additional_information(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:

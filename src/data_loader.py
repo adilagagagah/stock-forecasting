@@ -52,8 +52,11 @@ def load_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         
         # Tambahkan hari ini di baris paling bawah dengan fitur seluruhnya NaN
+        # lalu buat kolom 'Open' dengan nilai 'Close' periode sebelumnya
+        prev_close = df['Close'].iloc[-1] if not df.empty else float('nan')
         today = pd.Timestamp('today', tz=df.index.tz).normalize()
         df.loc[today] = float('nan')
+        df.loc[today, 'Open'] = prev_close + 2
         
         return df
         

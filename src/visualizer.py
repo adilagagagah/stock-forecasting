@@ -16,6 +16,11 @@ def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "
     """
     # 1. Validasi mutlak syarat data mplfinance
     df = df.copy()
+    
+    # Buang baris terakhir jika High, Low, Close, dan Volume semuanya NaN
+    if not df.empty and df.iloc[-1][['High', 'Low', 'Close', 'Volume']].isna().all():
+        df = df.iloc[:-1]
+        
     df.index = pd.to_datetime(df.index)
     
     # 2. Kustomisasi Tema Grafik Standar Industri (Clean & Professional)
