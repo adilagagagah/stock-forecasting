@@ -1,7 +1,10 @@
 import os
 import pandas as pd
+import math
 import matplotlib.dates as mdates
 import mplfinance as mpf
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "../data/processed") -> None:
     """
@@ -100,3 +103,57 @@ def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "
         
     except Exception as e:
         raise RuntimeError(f"Gagal memvisualisasikan grafik untuk {ticker_name}. Error: {str(e)}")
+
+def comparison_chart(first_data_list=[], second_data_list=[], 
+                        first_label_list=[], second_label_list=[], 
+                        title_list=[], set_xlabel_list=[], set_ylabel_list=[],
+                        suptitle='', label_format=lambda x:f"{x:.2f}", 
+                        point_data_label=False):
+    """
+    Membuat grafik perbandingan beberapa dataset.
+    
+    Parameters:
+    - figsize (tuple): Ukuran grafik.
+    - first_data_list (list): List data pertama.
+    - second_data_list (list): List data kedua.
+    - first_label_list (list): List label data pertama.
+    - second_label_list (list): List label data kedua.
+    - title_list (list): List judul grafik.
+    - set_xlabel_list (list): List label xlabel.
+    - set_ylabel_list (list): List label ylabel.
+    - suptitle (str): Judul utama grafik.
+    - point_data_label (bool): Apakah akan menampilkan label data di setiap titik grafik.
+    - label_format (str): Format label data.
+    """
+    # Set tema grafik profesional
+    sns.set_theme(style="whitegrid")
+    n_graphs = len(first_data_list)
+    n_col = min(3, n_graphs)
+    n_row = math.ceil(n_graphs / n_col)
+    figsize = (min(n_graphs * 7, 20), n_row * 6)
+
+    fig, axes = plt.subplots(n_row, n_col, figsize=figsize)
+    axes = axes.flatten()
+    main_color_list = ['#1f77b4', '#2ca02c', '#9467bd']
+    second_color_list = ['#ff7f0e', '#d62728', '#8c564b']
+
+    for i in range(n_graphs):
+        axes[i].plot(first_data_list[i], label=first_label_list[i], color=main_color_list[0], linewidth=2)
+        axes[i].plot(second_data_list[i], label=second_label_list[i], color=second_color_list[0], linestyle='--', linewidth=2)
+        axes[i].set_title(title_list[i], fontsize=12, fontweight='bold')
+        axes[i].set_xlabel(set_xlabel_list[i], fontsize=10)
+        axes[i].set_ylabel(set_ylabel_list[i], fontsize=10)
+        axes[i].legend()
+
+        if point_data_label:
+            for j, txt in enumerate(first_data_list[i]):
+                axes[i].annotate(label_format(txt), (j, first_data_list[i][j]), textcoords="offset points", xytext=(0,10), ha='center', fontweight='bold', color='#1f77b4')
+            for j, txt in enumerate(second_data_list[i]):
+                axes[i].annotate(label_format(txt), (j, second_data_list[i][j]), textcoords="offset points", xytext=(0,-15), ha='center', color='#ff7f0e')
+
+    for i in range(n_graphs, len(axes)):
+        axes[i].set_visible(False)
+
+    plt.tight_layout()
+    plt.suptitle(suptitle, fontsize=16, fontweight='bold', y=1.06)
+    plt.show()
