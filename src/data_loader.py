@@ -63,3 +63,23 @@ def load_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame
     except Exception as e:
         # Menyediakan error message yang jelas untuk keperluan logging produksi
         raise RuntimeError(f"Gagal memuat data pasar untuk {ticker}. Error: {str(e)}")
+
+def dataset_splitting(X, y):
+    # Pastikan indeks data berbentuk DatetimeIndex
+    X.index = pd.to_datetime(X.index)
+    y.index = pd.to_datetime(y.index)
+
+    # 1. Isolasi Periode In-Sample (Train & Validation Base: 2015 - 2023)
+    X_in_sample = X.loc['2015-01-01':'2023-12-31']
+    y_in_sample = y.loc['2015-01-01':'2023-12-31']
+
+    # 2. Isolasi Periode Out-of-Sample (Test Set & Backtest Engine: 2024 - 2025)
+    # Data ini tidak boleh disentuh sedikit pun selama proses tuning hyperparameter
+    X_out_sample = X.loc['2024-01-01':'2025-12-31']
+    y_out_sample = y.loc['2024-01-01':'2025-12-31']
+
+    # 3. Live Paper Trading / Forward Test
+    X_forward = X.loc['2026-01-01':]
+    y_forward = y.loc['2026-01-01':]
+
+    return X_in_sample, y_in_sample, X_out_sample, y_out_sample, X_forward, y_forward

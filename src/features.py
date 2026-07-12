@@ -47,6 +47,21 @@ def calculate_technical_indicators(df: pd.DataFrame, period: int = 14) -> pd.Dat
     df['RSI'] = rsi_raw.shift(1)
     df['Volume_Ratio'] = volume_ratio_raw.shift(1)
     df['Log_Return'] = log_return_raw.shift(1)
+
+    # ADDITIONAL INDICATOR
+    # 5. Momentum MACD (Moving Average Convergence Divergence)
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = (macd_line - signal_line).shift(1)
+
+    # 6. Jarak Harga terhadap MA-20 (Mean Reversion)
+    ma20 = df['Close'].rolling(window=20).mean()
+    df['Dist_to_MA20'] = ((df['Close'] - ma20) / ma20).shift(1) # Geser 1 hari
+
+    # 7. Volatilitas Harga Historis (Historical Volatility 5 Hari)
+    df['Hist_Volatility_5d'] = df['Log_Return'].rolling(window=5).std().shift(1)
     
     return df
 

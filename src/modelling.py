@@ -120,15 +120,21 @@ class TargetModellingPipeline:
         }
         return self.best_pipeline
 
-    def save(self, folder_path: str):
+    def save(self, folder_path: str, ticker: str = None):
         """ Simpan model beserta metadata lengkap ke dalam satu file .pkl """
         if self.best_pipeline is None:
             raise ValueError("Model belum dilatih.")
         
-        # SOLUSI FileNotFoundError: Otomatis buat folder jika belum ada
-        os.makedirs(folder_path, exist_ok=True)
+        if ticker:
+            # Simpan di dalam folder_path/{ticker}
+            target_folder = os.path.join(folder_path, ticker)
+            filepath = os.path.join(target_folder, f"model_{self.target_name}_{ticker}.pkl")
+        else:
+            target_folder = folder_path
+            filepath = os.path.join(target_folder, f"model_{self.target_name}.pkl")
         
-        filepath = os.path.join(folder_path, f"model_{self.target_name}.pkl")
+        # SOLUSI FileNotFoundError: Otomatis buat folder jika belum ada
+        os.makedirs(target_folder, exist_ok=True)
         
         # Menyusun struktur metadata ke dalam dictionary payload
         metadata_payload = {
@@ -142,6 +148,8 @@ class TargetModellingPipeline:
                 'trained_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
         }
+        if ticker:
+            metadata_payload['metadata']['ticker'] = ticker
         
         # Ekspor berkas paket lengkap
         joblib.dump(metadata_payload, filepath)
