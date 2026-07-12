@@ -72,11 +72,51 @@ class TargetModellingPipeline:
         pure_train_preds = self.best_pipeline.predict(X)
         train_mae = mean_absolute_error(y, pure_train_preds)
         train_r2 = r2_score(y, pure_train_preds)
+
+        # DIRECTIONAL ACCURACY (Hit Rate) - Sangat Krusial untuk Trading!
+        # Menghitung seberapa sering model benar menebak arah (Naik/Turun)
+        # Mengabaikan target yang nilainya 0 untuk menghindari bias
+        if self.target_name == 'trend_slope':
+            # Target Tren: Hit Rate diukur dari kesamaan arah (Positif=Naik, Negatif=Turun)
+            valid_idx = y != 0
+            if valid_idx.sum() > 0:
+                correct = np.sign(y[valid_idx]) == np.sign(pure_train_preds[valid_idx])
+                hit_rate = np.mean(correct) * 100
+            else:
+                hit_rate = 0.0
+        elif 'days_to_' in self.target_name:
+            # Target Waktu: Hit Rate diukur jika tebakan meleset MAKSIMAL 1 hari (Toleransi ketat)
+            pred_rounded = np.clip(np.round(pure_train_preds), 1, 5)
+            correct = np.abs(y - pred_rounded) <= 1
+            hit_rate = np.mean(correct) * 100
+        elif self.target_name == 'return':
+            # BAGUS: Kenyataan (y) LEBIH TINGGI atau SAMA DENGAN Prediksi (dikurangi toleransi meleset 1%)
+            # Cth: Pred 2%, Aktual 5% -> 5% >= (2% - 1%) -> TRUE (Take Profit Tersentuh)
+            # Cth: Pred 5%, Aktual 1% -> 1% >= (5% - 1%) -> FALSE (Gagal)
+            valid_preds = pure_train_preds > 0 # Hanya hitung jika model menyuruh beli (prediksi positif)
+            if valid_preds.sum() > 0:
+                correct = y[valid_preds] >= (pure_train_preds[valid_preds] - 0.01)
+                hit_rate = np.mean(correct) * 100
+            else:
+                hit_rate = 0.0     
+        elif self.target_name == 'risk':
+            # BAGUS: Kenyataan (y) TIDAK LEBIH DALAM dari Prediksi (ditambah toleransi 1%)
+            # Cth: Pred -5%, Aktual -3% -> -3% >= (-5% - 1%) -> TRUE (Stop Loss Aman)
+            # Cth: Pred -5%, Aktual -10% -> -10% >= (-5% - 1%) -> FALSE (Stop Loss Jebol)
+            valid_preds = pure_train_preds < 0 # Hanya hitung prediksi penurunan
+            if valid_preds.sum() > 0:
+                correct = y[valid_preds] >= (pure_train_preds[valid_preds] - 0.01)
+                hit_rate = np.mean(correct) * 100
+            else:
+                hit_rate = 0.0
+        else:
+            hit_rate = 0.0
         
         self.metrics = {
             'Train_MAE': train_mae,
             'Val_MAE': val_mae,
-            'Train_R2': train_r2
+            'Train_R2': train_r2,
+            'Hit_Rate_%': hit_rate
         }
         return self.best_pipeline
 
