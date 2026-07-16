@@ -1,12 +1,13 @@
 import pandas as pd
 import numpy as np
+import joblib
+import os
+import datetime
+from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
-import joblib
-import os
-import datetime
 
 class TargetModellingPipeline:
     def __init__(self, target_name: str, feature_cols: list, n_splits=5):
@@ -60,10 +61,6 @@ class TargetModellingPipeline:
         
         # Bersihkan prefix 'model__' dari nama hyperparameter agar rapi saat dibaca & disimpan
         self.best_params = {k.replace('model__', ''): v for k, v in grid_search.best_params_.items()}
-        
-        # Tampilkan informasi model terbaik ke konsol secara eksplisit
-        print(f"   -> [MODEL TERBAIK]: {self.model_name}")
-        print(f"   -> [HYPERPARAMETERS]: {self.best_params}")
 
         # Val_MAE: Rata-rata error pada Out-of-Fold (Validation)
         val_mae = -grid_search.best_score_
@@ -112,6 +109,10 @@ class TargetModellingPipeline:
         else:
             hit_rate = 0.0
         
+        # Tampilkan informasi model terbaik ke konsol secara eksplisit
+        print(f"   -> [HYPERPARAMETERS]: {self.best_params}")
+        print(f"   -> [MODEL METRICS]: val MAE {val_mae:.4f} | Hit Rate {hit_rate:.2f}%")
+        
         self.metrics = {
             'Train_MAE': train_mae,
             'Val_MAE': val_mae,
@@ -124,17 +125,18 @@ class TargetModellingPipeline:
         """ Simpan model beserta metadata lengkap ke dalam satu file .pkl """
         if self.best_pipeline is None:
             raise ValueError("Model belum dilatih.")
+
+        base_folder = Path(folder_path)
         
         if ticker:
-            # Simpan di dalam folder_path/{ticker}
-            target_folder = os.path.join(folder_path, ticker)
-            filepath = os.path.join(target_folder, f"model_{self.target_name}_{ticker}.pkl")
+            target_folder = base_folder / ticker
+            filepath = target_folder / f"model_{self.target_name}_{ticker}.pkl"
         else:
-            target_folder = folder_path
-            filepath = os.path.join(target_folder, f"model_{self.target_name}.pkl")
+            target_folder = base_folder
+            filepath = target_folder / f"model_{self.target_name}.pkl"
         
         # SOLUSI FileNotFoundError: Otomatis buat folder jika belum ada
-        os.makedirs(target_folder, exist_ok=True)
+        target_folder.mkdir(parents=True, exist_ok=True)
         
         # Menyusun struktur metadata ke dalam dictionary payload
         metadata_payload = {
@@ -153,4 +155,129 @@ class TargetModellingPipeline:
         
         # Ekspor berkas paket lengkap
         joblib.dump(metadata_payload, filepath)
-        print(f"[SAVED] Berhasil mengekspor paket model + metadata ke: {filepath}")
+        print(f"[SAVED] Berhasil mengekspor paket model + metadata ke: {filepath.as_posix()}")
+
+
+class ModelEvaluator:
+    """
+    Class untuk mengevaluasi dan membandingkan performa model machine learning 
+    terhadap baseline berdasarkan karakteristik variabel target.
+    """
+    def __init__(self, target_name, baseline_name="DummyBaseline"):
+        self.target_name = target_name
+        self.baseline_name = baseline_name
+
+    def _sort_challengers(self, df_results):
+        """Mengurutkan seluruh model penantang dari yang terbaik hingga terburuk"""
+        challenger_data = df_results[df_results['Model'] != self.baseline_name]
+
+        if self.target_name in ['return', 'trend_slope']:
+            # Prioritas: Hit Rate tertinggi -> Val MAE terendah
+            return challenger_data.sort_values(
+                by=['Hit_Rate_%', 'Val_MAE'], 
+                ascending=[False, True]
+            )
+        else: # risk, days_to_max, days_to_min
+            # Prioritas: Val MAE terendah -> Hit Rate tertinggi
+            return challenger_data.sort_values(
+                by=['Val_MAE', 'Hit_Rate_%'], 
+                ascending=[True, False]
+            )
+
+    def _check_fit_status(self, train_mae, val_mae, train_r2):
+        """Logika Overfit Detector"""
+        if train_mae == 0:
+            return "Overfit Parah"
+        if train_r2 > 0.95: 
+            return "Overfit Parah (Menghafal Data, R2>95%)"
+        
+        mae_degradation = (val_mae - train_mae) / train_mae
+        if train_r2 > 0.80 and mae_degradation > 0.15:
+            # R2 tinggi tapi error membesar di validasi
+            return "Overfitting (R2 Tinggi & Error Melebar)"
+        elif mae_degradation > 0.25:
+            return "Overfitting"
+        elif mae_degradation < -0.10: 
+            return "Aneh (Val lebih baik)"
+        else:
+            return "Good Fit"
+    
+    def _select_optimal_challenger(self, sorted_challengers):
+        """
+        Mencari model terbaik yang berstatus Good Fit. 
+        Jika semua model overfit, otomatis menggunakan model peringkat pertama (fallback).
+        """
+        if sorted_challengers.empty:
+            raise ValueError("Tidak ada model penantang yang tersedia untuk dievaluasi.")
+
+        for index, row in sorted_challengers.iterrows():
+            c_train_mae = row['Train_MAE']
+            c_val_mae = row['Val_MAE']
+            c_train_r2 = row['Train_R2']
+            
+            status = self._check_fit_status(c_train_mae, c_val_mae, c_train_r2)
+            
+            # Jika menemukan yang Good Fit, langsung kembalikan baris tersebut dan hentikan pencarian
+            if status == "Good Fit":
+                return row
+                
+        # Fallback: Jika loop selesai dan tidak ada yang 'Good Fit', ambil peringkat 1
+        best_fallback_data = sorted_challengers.iloc[0]
+        return best_fallback_data
+
+    def _make_decision(self, c_hit_rate, bl_hit_rate, c_val_mae, bl_val_mae, fit_status):
+        """Menentukan apakah model lolos mengalahkan baseline"""
+        if self.target_name in ['return', 'trend_slope']:
+            if c_hit_rate > bl_hit_rate:
+                 return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
+            else:
+                 return "Gagal (Kalah Hit Rate dr Baseline)"
+        else:
+            if c_val_mae < bl_val_mae:
+                 return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
+            else:
+                 return "Gagal (Kalah MAE dr Baseline)"
+
+    def generate_evaluation_report(self, df_results):
+        """Method utama untuk mengeksekusi seluruh logika evaluasi dan mengembalikan dictionary laporan"""
+        baseline_data = df_results[df_results['Model'] == self.baseline_name].iloc[0]
+        sorted_challengers = self._sort_challengers(df_results)
+        best_challenger_data = self._select_optimal_challenger(sorted_challengers)
+
+        c_train_mae = best_challenger_data['Train_MAE']
+        c_val_mae = best_challenger_data['Val_MAE']
+        c_hit_rate = best_challenger_data['Hit_Rate_%']
+        c_train_r2 = best_challenger_data['Train_R2']
+        
+        bl_train_mae = baseline_data['Train_MAE']
+        bl_val_mae = baseline_data['Val_MAE']
+        bl_hit_rate = baseline_data['Hit_Rate_%']
+        bl_train_r2 = baseline_data['Train_R2']
+
+        challenger_fit_status = self._check_fit_status(c_train_mae, c_val_mae, c_train_r2)
+        baseline_fit_status = self._check_fit_status(bl_train_mae, bl_val_mae, bl_train_r2)
+        decision = self._make_decision(c_hit_rate, bl_hit_rate, c_val_mae, bl_val_mae, challenger_fit_status)
+
+        # Logika penentuan akhir 'Model Terpilih'
+        if "Lolos" in decision:
+            final_model = best_challenger_data['Model']
+            best_hit_rate = c_hit_rate
+            final_fit_status = challenger_fit_status
+        else:
+            final_model = baseline_data['Model']
+            best_hit_rate = bl_hit_rate
+            final_fit_status = baseline_fit_status
+
+        return {
+            'Target': self.target_name,
+            'Baseline Train MAE': round(bl_train_mae, 5),
+            'Baseline Val MAE': round(bl_val_mae, 5),
+            'Baseline Hit Rate (%)': f"{bl_hit_rate:.2f}%",
+            'Challenger Train MAE': round(c_train_mae, 5),
+            'Challenger Val MAE': round(c_val_mae, 5),
+            'Challenger Hit Rate (%)': f"{c_hit_rate:.2f}%",
+            'Keputusan': decision,
+            'Model Terpilih': final_model,
+            'Best Hit Rate': f"{round(best_hit_rate, 2)}%",
+            'Fit Status': final_fit_status
+        }
