@@ -1,0 +1,80 @@
+================================================================================
+           BLUEPRINT & RANCANGAN SISTEM TRADING KUANTITATIF (V1.0)
+================================================================================
+Tanggal Update : 24 Juli 2026
+Status Proyek  : Fase Data Pipeline Selesai -> Fase Modelling Selesai 
+                 -> Transisi ke Mesin Backtest (WFA)
+================================================================================
+
+1. ALUR DATA & REKAYASA FITUR (DATA PIPELINE)
+--------------------------------------------------------------------------------
+- Sumber Data   : Yahoo Finance (diunduh secara otomatis via yfinance).
+- Preprocessing : Pembersihan data (drop NaN & Volume 0), penyesuaian kolom.
+- Fitur (X)     : Dihasilkan oleh modul `features.py` (indikator teknikal, 
+                  momentum, dll) berbasis data historis penutupan harian.
+- Target (y)    : Diekstrak oleh modul `label.py` dengan jendela observasi harga
+                  selama 5 hari ke depan (T+0 s.d T+4).
+- Data Position : Sudah disesuaikan pada data OCHLV T+0, label di T+0 adalah data
+                  masa depan (T+0 s.d T+4), fitur di T+0 adalah data masa lalu
+                  (<=T-1).
+
+
+2. ARSITEKTUR MACHINE LEARNING (5 MODEL INDEPENDEN)
+--------------------------------------------------------------------------------
+Setiap keputusan trading tidak didasarkan pada satu model tunggal, melainkan 
+konsensus dari 5 model regresi/klasifikasi terpisah:
+1. Model 'trend_slope' : Memprediksi kemiringan / arah tren dalam T+4 (Naik/Turun).
+2. Model 'return'      : Memprediksi Max Profit (%) dalam T+4.
+3. Model 'risk'        : Memprediksi Max Drawdown/Loss (%) dalam T+4.
+4. Model 'days_to_max' : Memprediksi hari ke-berapa Take Profit akan tersentuh.
+5. Model 'days_to_min' : Memprediksi hari ke-berapa harga terendah akan terjadi.
+
+* Optimasi Model: Menggunakan TimeSeriesSplit CV untuk mencegah kebocoran data
+  (data leakage). Evaluasi didasarkan pada Hit Rate (Akurasi Arah) dan MAE, 
+  serta dilengkapi algoritma "Overfit Detector".
+
+
+3. MANAJEMEN RISIKO & LOGIKA EKSEKUSI (RISK ENGINE)
+--------------------------------------------------------------------------------
+- Modal Awal Standar : Rp 5.000.000 (Dapat disesuaikan).
+- Toleransi Risiko   : Max loss 2% dari total ekuitas per posisi trading.
+- Alokasi Maksimal   : 25% dari total ekuitas per saham (diversifikasi).
+- Kalkulasi Biaya    : Fee Beli 0.15% dan Fee Jual 0.25% dihitung langsung ke 
+                       dalam Net Target Profit dan Net Stop Loss.
+- Syarat Entry Valid : 
+  a. Prediksi trend_slope bernilai positif (> 0).
+  b. Rasio aktual Risk-to-Reward (setelah fee) >= 2.0.
+  c. Alokasi modal mampu membeli minimal 1 lot.
+
+
+4. METODOLOGI BACKTESTING : WALK-FORWARD ANALYSIS (WFA)
+--------------------------------------------------------------------------------
+Untuk menyimulasikan performa secara realistis tanpa bias masa depan:
+- Pendekatan    : Expanding Window (Data latih terus diakumulasi).
+- In-Sample     : 2015 - 2023 (Untuk base training & seleksi fitur/model).
+- Out-of-Sample : 2024 - 2025 (Untuk pengujian Backtest WFA).
+- Forward Test  : 2026 - dst (Paper trading & Live system).
+
+Siklus Eksekusi Backtest (Looping Harian):
+1. [Akhir Bulan] : Model di-retrain dengan data terbaru yang sudah terjadi.
+2. [Pagi T+0]    : Sistem menarik data s.d H-1, meracik prediksi hari ini.
+3. [Filter Risk] : Keputusan beli dieksekusi jika lolos parameter.
+4. [Evaluasi]    : Hard-Exit (Jual) jika menyentuh prediksi Take Profit, Stop 
+                   Loss, atau durasi holding melebihi batas waktu (Time-Stop).
+
+
+5. ROADMAP FITUR LANJUTAN (V2.0)
+--------------------------------------------------------------------------------
+Fitur di bawah ini hanya akan dikembangkan JIKA Baseline WFA pada fase 
+Out-of-Sample terbukti menghasilkan Expected Value (EV) yang positif:
+- [ ] Pyramiding Engine       : Tambah modal saat harga koreksi ke prediksi 
+                                days_to_min (selama tidak breakdown).
+- [ ] Trailing Stop           : Dinamis menaikkan batas Stop Loss saat harga naik.
+- [ ] Partial Take Profit     : Jual 50% di TP1, hold 50% sisanya dengan Trailing.
+- [ ] Dynamic Time-Stop       : Batas durasi T+Max disesuaikan dengan volatilitas 
+                                pasar (ATR) terkini.
+
+================================================================================
+Blueprint dirancang untuk mencegah emosi, menegakkan probabilitas, dan 
+menjaga kelangsungan modal melalui kalkulasi kuantitatif yang ketat.
+================================================================================

@@ -6,7 +6,7 @@ import mplfinance as mpf
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "../data/processed") -> None:
+def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "../data/processed", start_date: str = None, end_date: str = None) -> None:
     """
     Membuat grafik candlestick harian terintegrasi dengan volume.
     Sumbu X otomatis diset tepat pada setiap awal bulan.
@@ -16,6 +16,8 @@ def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "
     - df (pd.DataFrame): Dataframe saham yang memiliki DatetimeIndex dan kolom OHLCV.
     - ticker_name (str): Nama atau kode emiten untuk judul grafik (contoh: 'BUMI').
     - save_dir (str): Folder tempat menyimpan hasil ekspor grafik.
+    - start_date (str): Tanggal mulai rentang grafik (format YYYY-MM-DD).
+    - end_date (str): Tanggal akhir rentang grafik (format YYYY-MM-DD).
     """
     # 1. Validasi mutlak syarat data mplfinance
     df = df.copy()
@@ -25,6 +27,16 @@ def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "
         df = df.iloc[:-1]
         
     df.index = pd.to_datetime(df.index)
+    
+    # Filter rentang tanggal
+    if start_date:
+        df = df[df.index >= pd.to_datetime(start_date)]
+    if end_date:
+        df = df[df.index <= pd.to_datetime(end_date)]
+
+    if df.empty:
+        print("Data kosong setelah filter tanggal. Tidak ada grafik yang digambar.")
+        return
     
     # 2. Kustomisasi Tema Grafik Standar Industri (Clean & Professional)
     market_colors = mpf.make_marketcolors(
@@ -46,7 +58,7 @@ def plot_daily_candlestick(df: pd.DataFrame, ticker_name: str, save_dir: str = "
 
     try:
         is_monthly = False
-        if len(df) > 150:
+        if len(df) > 365:
             print(f"Data terlalu banyak ({len(df)} baris), melakukan binning bulanan...")
             df = df.resample('MS').agg({
                 'Open': 'first',
@@ -157,3 +169,192 @@ def comparison_chart(first_data_list=[], second_data_list=[],
     plt.tight_layout()
     plt.suptitle(suptitle, fontsize=16, fontweight='bold', y=1.06)
     plt.show()
+
+def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date: str = None, end_date: str = None, predictions_df: pd.DataFrame = None, equity_curve_df: pd.DataFrame = None, trades_df: pd.DataFrame = None):
+    """
+    Membuat grafik candlestick interaktif menggunakan Plotly.
+    Sangat cocok digunakan di dalam Jupyter Notebook untuk zoom dan pan.
+    
+    Parameters:
+    - df (pd.DataFrame): Dataframe saham yang memiliki DatetimeIndex dan kolom OHLCV.
+    - ticker_name (str): Nama atau kode emiten.
+    - start_date (str): Tanggal mulai (opsional).
+    - end_date (str): Tanggal akhir (opsional).
+    - predictions_df (pd.DataFrame): Dataframe hasil prediksi dari backtester (opsional).
+    - equity_curve_df (pd.DataFrame): Dataframe historis ekuitas dari backtester (opsional).
+    - trades_df (pd.DataFrame): Dataframe hasil trades/penjualan (opsional).
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print("Library 'plotly' tidak ditemukan. Silakan install menggunakan: pip install plotly")
+        return
+        
+    df = df.copy()
+    if not df.empty and df.iloc[-1][['High', 'Low', 'Close', 'Volume']].isna().all():
+        df = df.iloc[:-1]
+        
+    df.index = pd.to_datetime(df.index)
+    
+    if start_date:
+        df = df[df.index >= pd.to_datetime(start_date)]
+    if end_date:
+        df = df[df.index <= pd.to_datetime(end_date)]
+        
+    if df.empty:
+        print("Data kosong. Tidak ada grafik yang digambar.")
+        return
+
+    # Buat figure dengan 3 baris (Candlestick, Equity Curve, dan Volume)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, subplot_titles=(f'Candlestick {ticker_name.upper()}', 'Equity Curve', 'Volume'),
+                        row_width=[0.15, 0.25, 0.6],
+                        specs=[[{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]])
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(x=df.index,
+                                 open=df['Open'],
+                                 high=df['High'],
+                                 low=df['Low'],
+                                 close=df['Close'],
+                                 name='Price'),
+                  row=1, col=1, secondary_y=False)
+
+    # Tambahkan Hasil Prediksi jika ada
+    if predictions_df is not None and not predictions_df.empty:
+        pred_df = predictions_df.reindex(df.index)
+        
+        # 1. Plot Sinyal Beli sebagai Marker di bawah Candlestick
+        if 'signal_buy' in pred_df.columns:
+            buy_signals = pred_df[pred_df['signal_buy'] == True]
+            if not buy_signals.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_signals.index, 
+                    y=df.loc[buy_signals.index, 'Low'] * 0.95,
+                    mode='markers', 
+                    marker=dict(symbol='triangle-up', color='blue', size=12, line=dict(width=1, color='DarkSlateGrey')),
+                    name='Sinyal Beli'
+                ), row=1, col=1, secondary_y=False)
+                
+        # 2. Plot Prediksi RR, Return & Risk di Sumbu Y Sekunder
+        if 'actual_rr_ratio' in pred_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df['actual_rr_ratio'], mode='lines', 
+                line=dict(width=0), opacity=0, showlegend=False,
+                name='Actual RR Ratio', hovertemplate='%{y:.2f}'
+            ), row=1, col=1, secondary_y=True)
+
+        if 'pred_return' in pred_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df['pred_return'], mode='lines', 
+                line=dict(dash='dot', color='rgba(0, 128, 0, 0.4)'),
+                name='Pred Return', hovertemplate='%{y:.2%}'
+            ), row=1, col=1, secondary_y=True)
+            
+        if 'pred_risk' in pred_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df['pred_risk'].abs(), mode='lines', 
+                line=dict(dash='dot', color='rgba(255, 0, 0, 0.4)'),
+                name='Pred Risk', hovertemplate='%{y:.2%}'
+            ), row=1, col=1, secondary_y=True)
+            
+        # 3. Tambahkan 3 variabel lain ke hover (invisible lines agar tidak mengotori chart)
+        if 'pred_trend_slope' in pred_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df['pred_trend_slope'], mode='lines', 
+                line=dict(width=0), opacity=0, showlegend=False,
+                name='pred Trend Slope', hovertemplate='%{y:.2%}'
+            ), row=1, col=1, secondary_y=True)
+            
+        if 'pred_days_to_max' in pred_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df['pred_days_to_max'], mode='lines', 
+                line=dict(width=0), opacity=0, showlegend=False,
+                name='Days to Max', hovertemplate='%{y:.0f} Hari'
+            ), row=1, col=1, secondary_y=True)
+            
+        if 'pred_days_to_min' in pred_df.columns:
+            fig.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df['pred_days_to_min'], mode='lines', 
+                line=dict(width=0), opacity=0, showlegend=False,
+                name='Days to Min', hovertemplate='%{y:.0f} Hari'
+            ), row=1, col=1, secondary_y=True)
+
+    # Tambahkan Sinyal Jual jika ada trades_df
+    if trades_df is not None and not trades_df.empty:
+        t_df = trades_df.copy()
+        if 'exit_date' in t_df.columns:
+            t_df['exit_date'] = pd.to_datetime(t_df['exit_date'])
+            
+        # Slicing agar hanya menampilkan trade pada rentang tanggal chart
+        t_df = t_df[t_df['exit_date'].isin(df.index)]
+        
+        y_positions = []
+        hover_texts = []
+        exit_dates = []
+        
+        for idx, row in t_df.iterrows():
+            d = row['exit_date']
+            exit_dates.append(d)
+            if d in df.index:
+                y_pos = df.loc[d, 'High'] * 1.05
+            else:
+                y_pos = row['exit_price'] * 1.05
+            y_positions.append(y_pos)
+            
+            text = f"Alasan Jual: {row['exit_reason']}<br>Profit: Rp{row['net_profit']:,.2f} ({row['roi_pct']:+.2f}%)"
+            hover_texts.append(text)
+            
+        fig.add_trace(go.Scatter(
+            x=exit_dates, 
+            y=y_positions,
+            mode='markers', 
+            marker=dict(symbol='triangle-down', color='red', size=12, line=dict(width=1, color='DarkSlateGrey')),
+            name='Sinyal Jual',
+            text=hover_texts,
+            hovertemplate='%{text}'
+        ), row=1, col=1, secondary_y=False)
+
+    # Tambahkan Equity Curve jika ada
+    if equity_curve_df is not None and not equity_curve_df.empty:
+        equity_df = equity_curve_df.copy()
+        if 'date' in equity_df.columns:
+            equity_df = equity_df.set_index('date')
+        equity_df.index = pd.to_datetime(equity_df.index)
+        equity_df = equity_df.reindex(df.index)
+        if 'cash' in equity_df.columns:
+            # Isi ffill untuk mengisi hari-hari di mana tidak ada record transaksi tapi cash tetap
+            equity_df['cash'] = equity_df['cash'].ffill()
+            fig.add_trace(go.Scatter(
+                x=equity_df.index, 
+                y=equity_df['cash'], 
+                mode='lines', 
+                line=dict(color='royalblue', width=2),
+                name='Total Cash (Rp)'
+            ), row=2, col=1)
+            fig.update_yaxes(title_text="Equity (Rp)", row=2, col=1)
+
+    # Volume (Warna hijau jika harga naik, merah jika turun)
+    colors = ['green' if close >= open else 'red' for close, open in zip(df['Close'], df['Open'])]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='Volume'),
+                  row=3, col=1)
+
+    # Layout dan range slider
+    fig.update_layout(
+        title=f"Grafik Interaktif Emiten {ticker_name.upper()}",
+        yaxis_title='Harga Saham (Rp)',
+        xaxis_rangeslider_visible=False,
+        height=700,
+        template='plotly_white',
+        hovermode='x unified'
+    )
+    
+    if predictions_df is not None and not predictions_df.empty:
+        fig.update_yaxes(title_text="Prediksi (%)", tickformat='.0%', range=[-0.2, 0.2], secondary_y=True, row=1, col=1)
+    
+    # Hide non-trading days (weekends/holidays) by excluding them from x-axis
+    # Note: Plotly doesn't natively hide gaps, we can convert x-axis to category but it disables some date features.
+    # We will just rely on the default time series axis for now.
+    
+    fig.show()
