@@ -130,10 +130,7 @@ class WalkForwardBacktester:
             # B. DAILY TRADING LOOP (Iterasi harian sepanjang bulan berjalan)
             for current_date, daily_row in month_features.iterrows():
                 
-                # B.1 END-OF-DAY EVALUATION: Cek Exit (TP, SL, Time-Stop) untuk posisi aktif
-                self._process_active_exits(current_date, df_raw_prices)
-
-                # B.2 PRE-MARKET PREDICTION: Prediksi 5 target untuk strategi hari ini (T+0)
+                # B.1 PRE-MARKET PREDICTION: Prediksi 5 target untuk strategi hari ini (T+0)
                 preds = {}
                 
                 for target in self.targets:
@@ -141,7 +138,7 @@ class WalkForwardBacktester:
                     feature_vector = daily_row[target_features].values.reshape(1, -1)
                     preds[target] = self.trained_pipelines[target].predict(feature_vector)[0]
 
-                # B.3 RISK MANAGER EVALUATION: Hitung kelayakan transaksi & position sizing
+                # B.2 RISK MANAGER EVALUATION: Hitung kelayakan transaksi & position sizing
                 entry_price_today = df_raw_prices.loc[current_date, 'Open']
                 
                 risk_eval = evaluate_trade_risk(
@@ -159,9 +156,12 @@ class WalkForwardBacktester:
                     max_allocation_percentage=self.max_alloc_pct
                 )
 
-                # B.4 EXECUTION ENGINE: Beli jika disetujui Risk Manager
-                if risk_eval['execute_trade']:
+                # B.3 EXECUTION ENGINE (OPENING): Beli di harga Open jika disetujui (Maks 1 posisi)
+                if risk_eval['execute_trade'] and len(self.active_trades) == 0:
                     self._execute_buy_order(current_date, risk_eval, preds)
+
+                # B.4 END-OF-DAY EVALUATION: Cek Exit (TP, SL, Time-Stop) untuk posisi aktif
+                self._process_active_exits(current_date, df_raw_prices)
 
                 # Simpan Prediksi Harian
                 self.daily_predictions.append({
@@ -176,9 +176,11 @@ class WalkForwardBacktester:
                 })
 
                 # Record Ekuitas Harian
+                active_value = sum(t['shares'] * df_raw_prices.loc[current_date, 'Close'] for t in self.active_trades)
                 self.equity_curve.append({
                     'date': current_date,
                     'cash': self.current_capital,
+                    'total_equity': self.current_capital + active_value,
                     'active_positions': len(self.active_trades)
                 })
 
@@ -189,6 +191,12 @@ class WalkForwardBacktester:
             for target in self.targets:
                 y_month_actual = y_oos_dict[target].loc[month_features.index]
                 y_train_current[target] = pd.concat([y_train_current[target], y_month_actual])
+
+        # Force close any remaining active trades on the last available date
+        if self.active_trades:
+            last_date = X_oos.index[-1]
+            print(f"\n[INFO] Menutup paksa {len(self.active_trades)} posisi aktif di akhir backtest ({last_date.date()})")
+            self._process_active_exits(last_date, df_raw_prices, force_close=True)
 
         # Konversi prediksi menjadi DataFrame
         if self.daily_predictions:
@@ -224,9 +232,10 @@ class WalkForwardBacktester:
         }
         
         self.active_trades.append(trade)
-        print(f"  [BUY LOG] {date.date()} | Beli {trade['lots']} Lot @ Rp{trade['entry_price']:,} | Capital: Rp{capital_needed:,.2f}")
+        total_equity = self.current_capital + capital_needed
+        print(f"  [BUY LOG]  {date.date()} | Beli                 @ Rp{trade['entry_price']:<7,.2f} | Lot: {trade['lots']:<4} | Modal : Rp{capital_needed:>10,.2f}            | Ekuitas: Rp{total_equity:>12,.2f}")
 
-    def _process_active_exits(self, current_date, df_raw_prices: pd.DataFrame):
+    def _process_active_exits(self, current_date, df_raw_prices: pd.DataFrame, force_close: bool = False):
         """Mengevaluasi Hard-Exit (TP, SL, Time-Stop) pada akhir hari bursa"""
         if not self.active_trades or current_date not in df_raw_prices.index:
             return
@@ -237,16 +246,22 @@ class WalkForwardBacktester:
         close_price = today_price['Close']
 
         for trade in self.active_trades[:]:
-            trade['days_held'] += 1
+            is_entry_day = (trade['entry_date'] == current_date)
+            
+            if not force_close and not is_entry_day:
+                trade['days_held'] += 1
             
             # Logika Pemicu Exit (Hard-Exit Rules)
             hit_tp = high_price >= trade['tp_price']
             hit_sl = low_price <= trade['sl_price']
             hit_time_stop = trade['days_held'] >= trade['max_holding_days']
 
-            if hit_tp or hit_sl or hit_time_stop:
+            if hit_tp or hit_sl or hit_time_stop or force_close:
                 # Penentuan Harga Jual Realistis
-                if hit_tp:
+                if force_close:
+                    exit_price = close_price
+                    exit_reason = "Akhir Backtest"
+                elif hit_tp:
                     exit_price = trade['tp_price']
                     exit_reason = "Take Profit"
                 elif hit_sl:
@@ -264,6 +279,10 @@ class WalkForwardBacktester:
 
                 # Kembalikan dana ke kas tunai
                 self.current_capital += net_proceeds
+                
+                # Kalkulasi total ekuitas setelah jual
+                active_value = sum(t['shares'] * close_price for t in self.active_trades if t != trade)
+                total_equity = self.current_capital + active_value
 
                 # Catat ke riwayat
                 log_entry = {
@@ -278,13 +297,15 @@ class WalkForwardBacktester:
                     'net_profit': net_profit,
                     'roi_pct': roi_pct,
                     'days_held': trade['days_held'],
-                    'exit_reason': exit_reason
+                    'exit_reason': exit_reason,
+                    'tp_price': trade['tp_price'],
+                    'sl_price': trade['sl_price']
                 }
                 
                 self.trade_history.append(log_entry)
                 self.active_trades.remove(trade)
 
-                print(f"  [EXIT LOG] {current_date.date()} | Jual ({exit_reason}) @ Rp{exit_price:,.2f} | Profit: Rp{net_profit:,.2f} ({roi_pct:+.2f}%)")
+                print(f"  [SELL LOG] {current_date.date()} | Jual ({exit_reason:<12}) @ Rp{exit_price:<7,.2f} | Lot: {trade['lots']:<4} | Profit: Rp{net_profit:>10,.2f} ({roi_pct:>+6.2f}%) | Ekuitas: Rp{total_equity:>12,.2f}")
 
     def _summarize_performance(self):
         """Menghitung metrik evaluasi akhir portofolio"""
@@ -319,3 +340,92 @@ class WalkForwardBacktester:
         print("=" * 70)
 
         return df_trades, df_equity
+
+    def generate_journal(self, df_raw_prices: pd.DataFrame, save_csv_path: str = None) -> pd.DataFrame:
+        """Menghasilkan jurnal harian terintegrasi antara data OHLCV dan hasil trading. Bisa langsung disave ke CSV jika save_csv_path diisi."""
+        if not self.equity_curve:
+            return df_raw_prices.copy()
+            
+        start_date = self.equity_curve[0]['date']
+        end_date = self.equity_curve[-1]['date']
+        
+        journal = df_raw_prices.loc[start_date:end_date].copy()
+        
+        # Tambahkan kolom default
+        journal['Keputusan'] = '-'
+        journal['Harga Eksekusi'] = 0.0
+        journal['Lot'] = 0
+        journal['Value Transaksi'] = 0.0
+        journal['Sisa Equity'] = 0.0
+        journal['Total Equity'] = 0.0
+        
+        # Mapping data dari equity_curve
+        df_eq = pd.DataFrame(self.equity_curve).set_index('date')
+        if 'cash' in df_eq.columns:
+            journal['Sisa Equity'] = df_eq['cash']
+        if 'total_equity' in df_eq.columns:
+            journal['Total Equity'] = df_eq['total_equity']
+            
+        # Mapping transaksi (Buy & Sell) dari trade_history (sudah closed)
+        for trade in self.trade_history:
+            entry_d = trade['entry_date']
+            if entry_d in journal.index:
+                if journal.at[entry_d, 'Keputusan'] == '-':
+                    journal.at[entry_d, 'Keputusan'] = 'Buy'
+                else:
+                    journal.at[entry_d, 'Keputusan'] += ' & Buy'
+                journal.at[entry_d, 'Harga Eksekusi'] = trade['entry_price']
+                journal.at[entry_d, 'Lot'] = trade['lots']
+                journal.at[entry_d, 'Value Transaksi'] = trade['capital_spent']
+                
+            exit_d = trade['exit_date']
+            if exit_d in journal.index:
+                if journal.at[exit_d, 'Keputusan'] == '-':
+                    journal.at[exit_d, 'Keputusan'] = 'Sell'
+                else:
+                    journal.at[exit_d, 'Keputusan'] += ' & Sell'
+                journal.at[exit_d, 'Harga Eksekusi'] = trade['exit_price']
+                journal.at[exit_d, 'Lot'] = trade['lots']
+                journal.at[exit_d, 'Value Transaksi'] = trade['net_proceeds']
+
+        # Mapping transaksi (Buy) yang masih aktif (belum closed) jika ada
+        for trade in self.active_trades:
+            entry_d = trade['entry_date']
+            if entry_d in journal.index:
+                if journal.at[entry_d, 'Keputusan'] == '-':
+                    journal.at[entry_d, 'Keputusan'] = 'Buy'
+                else:
+                    journal.at[entry_d, 'Keputusan'] += ' & Buy'
+                journal.at[entry_d, 'Harga Eksekusi'] = trade['entry_price']
+                journal.at[entry_d, 'Lot'] = trade['lots']
+                journal.at[entry_d, 'Value Transaksi'] = trade['capital_spent']
+                
+        # Forward fill equity if any NaN
+        journal['Sisa Equity'] = journal['Sisa Equity'].ffill()
+        journal['Total Equity'] = journal['Total Equity'].ffill()
+        
+        # Reorder columns: 1-5 (OHLCV), 6-11 custom
+        cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'Keputusan', 'Harga Eksekusi', 'Lot', 'Value Transaksi', 'Sisa Equity', 'Total Equity']
+        # If there are other existing columns, keep them at the end
+        other_cols = [c for c in journal.columns if c not in cols]
+        
+        final_journal = journal[cols + other_cols].copy()
+        
+        # Format nilai ke dalam standar ribuan/jutaan dengan koma
+        format_float = ['Open', 'High', 'Low', 'Close', 'Harga Eksekusi', 'Value Transaksi', 'Sisa Equity', 'Total Equity']
+        format_int = ['Volume', 'Lot']
+        
+        for col in format_float:
+            if col in final_journal.columns:
+                final_journal[col] = final_journal[col].apply(lambda x: f"{x:,.2f}" if pd.notnull(x) else x)
+                
+        for col in format_int:
+            if col in final_journal.columns:
+                final_journal[col] = final_journal[col].apply(lambda x: f"{int(x):,}" if pd.notnull(x) else x)
+        
+        if save_csv_path:
+            os.makedirs(os.path.dirname(save_csv_path) or '.', exist_ok=True)
+            final_journal.to_csv(save_csv_path)
+            print(f"[INFO] Jurnal berhasil disimpan ke: {save_csv_path}")
+            
+        return final_journal

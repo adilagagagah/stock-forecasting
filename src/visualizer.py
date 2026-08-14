@@ -225,17 +225,7 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
     if predictions_df is not None and not predictions_df.empty:
         pred_df = predictions_df.reindex(df.index)
         
-        # 1. Plot Sinyal Beli sebagai Marker di bawah Candlestick
-        if 'signal_buy' in pred_df.columns:
-            buy_signals = pred_df[pred_df['signal_buy'] == True]
-            if not buy_signals.empty:
-                fig.add_trace(go.Scatter(
-                    x=buy_signals.index, 
-                    y=df.loc[buy_signals.index, 'Low'] * 0.95,
-                    mode='markers', 
-                    marker=dict(symbol='triangle-up', color='blue', size=12, line=dict(width=1, color='DarkSlateGrey')),
-                    name='Sinyal Beli'
-                ), row=1, col=1, secondary_y=False)
+        # 1. (Dihapus: Sinyal beli sekarang diplot dari trades_df agar data selaras)
                 
         # 2. Plot Prediksi RR, Return & Risk di Sumbu Y Sekunder
         if 'actual_rr_ratio' in pred_df.columns:
@@ -281,40 +271,76 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
                 name='Days to Min', hovertemplate='%{y:.0f} Hari'
             ), row=1, col=1, secondary_y=True)
 
-    # Tambahkan Sinyal Jual jika ada trades_df
+    # Tambahkan Sinyal Beli dan Jual dari trades_df
     if trades_df is not None and not trades_df.empty:
         t_df = trades_df.copy()
+        if 'entry_date' in t_df.columns:
+            t_df['entry_date'] = pd.to_datetime(t_df['entry_date'])
         if 'exit_date' in t_df.columns:
             t_df['exit_date'] = pd.to_datetime(t_df['exit_date'])
             
-        # Slicing agar hanya menampilkan trade pada rentang tanggal chart
-        t_df = t_df[t_df['exit_date'].isin(df.index)]
-        
-        y_positions = []
-        hover_texts = []
-        exit_dates = []
-        
-        for idx, row in t_df.iterrows():
+        # --- Plot Buy Signals ---
+        t_df_buy = t_df[t_df['entry_date'].isin(df.index)]
+        buy_y = []
+        buy_hover = []
+        for idx, row in t_df_buy.iterrows():
+            d = row['entry_date']
+            if d in df.index:
+                y_pos = df.loc[d, 'Low'] * 0.95
+            else:
+                y_pos = row['entry_price'] * 0.95
+            buy_y.append(y_pos)
+            
+            text = (f"ID Transaksi: {row.get('trade_id', '')}<br>"
+                    f"Beli: {d.strftime('%Y-%m-%d')}<br>"
+                    f"Harga: Rp{row['entry_price']:,.2f}<br>"
+                    f"Lot: {row['lots']}<br>"
+                    f"Value: Rp{row.get('capital_spent', 0):,.2f}<br>"
+                    f"TP: Rp{row.get('tp_price', 0):,.2f}<br>"
+                    f"SL: Rp{row.get('sl_price', 0):,.2f}")
+            buy_hover.append(text)
+            
+        if not t_df_buy.empty:
+            fig.add_trace(go.Scatter(
+                x=t_df_buy['entry_date'],
+                y=buy_y,
+                mode='markers',
+                marker=dict(symbol='triangle-up', color='blue', size=12, line=dict(width=1, color='DarkSlateGrey')),
+                name='Sinyal Beli',
+                text=buy_hover,
+                hovertemplate='%{text}<extra></extra>'
+            ), row=1, col=1, secondary_y=False)
+
+        # --- Plot Sell Signals ---
+        t_df_sell = t_df[t_df['exit_date'].isin(df.index)]
+        sell_y = []
+        sell_hover = []
+        for idx, row in t_df_sell.iterrows():
             d = row['exit_date']
-            exit_dates.append(d)
             if d in df.index:
                 y_pos = df.loc[d, 'High'] * 1.05
             else:
                 y_pos = row['exit_price'] * 1.05
-            y_positions.append(y_pos)
+            sell_y.append(y_pos)
             
-            text = f"Alasan Jual: {row['exit_reason']}<br>Profit: Rp{row['net_profit']:,.2f} ({row['roi_pct']:+.2f}%)"
-            hover_texts.append(text)
+            text = (f"ID Pembelian: {row.get('trade_id', '')}<br>"
+                    f"Jual: {d.strftime('%Y-%m-%d')}<br>"
+                    f"Harga: Rp{row['exit_price']:,.2f}<br>"
+                    f"Lot: {row['lots']}<br>"
+                    f"Alasan Jual: {row['exit_reason']}<br>"
+                    f"Profit: Rp{row['net_profit']:,.2f} ({row['roi_pct']:+.2f}%)")
+            sell_hover.append(text)
             
-        fig.add_trace(go.Scatter(
-            x=exit_dates, 
-            y=y_positions,
-            mode='markers', 
-            marker=dict(symbol='triangle-down', color='red', size=12, line=dict(width=1, color='DarkSlateGrey')),
-            name='Sinyal Jual',
-            text=hover_texts,
-            hovertemplate='%{text}'
-        ), row=1, col=1, secondary_y=False)
+        if not t_df_sell.empty:
+            fig.add_trace(go.Scatter(
+                x=t_df_sell['exit_date'],
+                y=sell_y,
+                mode='markers',
+                marker=dict(symbol='triangle-down', color='red', size=12, line=dict(width=1, color='DarkSlateGrey')),
+                name='Sinyal Jual',
+                text=sell_hover,
+                hovertemplate='%{text}<extra></extra>'
+            ), row=1, col=1, secondary_y=False)
 
     # Tambahkan Equity Curve jika ada
     if equity_curve_df is not None and not equity_curve_df.empty:
@@ -347,7 +373,7 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
         xaxis_rangeslider_visible=False,
         height=700,
         template='plotly_white',
-        hovermode='x unified'
+        hovermode='closest'
     )
     
     if predictions_df is not None and not predictions_df.empty:
