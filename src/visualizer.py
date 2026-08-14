@@ -221,6 +221,25 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
                                  name='Price'),
                   row=1, col=1, secondary_y=False)
 
+    # EMA 5 & EMA 10 & EMA 20
+    ema5 = df['Close'].ewm(span=5, adjust=False).mean()
+    ema10 = df['Close'].ewm(span=10, adjust=False).mean()
+    ema20 = df['Close'].ewm(span=20, adjust=False).mean()
+    
+    fig.add_trace(go.Scatter(x=df.index, y=ema5, mode='lines', 
+                             line=dict(color='red', width=1.5), 
+                             name='EMA 5', hovertemplate='EMA 5: Rp%{y:,.0f}<extra></extra>'),
+                  row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=ema10, mode='lines', 
+                             line=dict(color='orange', width=1.5), 
+                             name='EMA 10', hovertemplate='EMA 10: Rp%{y:,.0f}<extra></extra>'),
+                  row=1, col=1, secondary_y=False)
+                  
+    fig.add_trace(go.Scatter(x=df.index, y=ema20, mode='lines', 
+                             line=dict(color='purple', width=1.5), 
+                             name='EMA 20', hovertemplate='EMA 20: Rp%{y:,.0f}<extra></extra>'),
+                  row=1, col=1, secondary_y=False)
+
     # Tambahkan Hasil Prediksi jika ada
     if predictions_df is not None and not predictions_df.empty:
         pred_df = predictions_df.reindex(df.index)

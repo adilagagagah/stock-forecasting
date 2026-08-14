@@ -1,6 +1,29 @@
 import math
 from typing import Dict, Any
 
+def round_to_idx_tick(price: float) -> int:
+    """
+    Membulatkan harga ke fraksi (tick size) Bursa Efek Indonesia (IDX) terdekat.
+    Aturan fraksi:
+    < 200 : 1
+    200 - 500 : 2
+    500 - 2000 : 5
+    2000 - 5000 : 10
+    >= 5000 : 25
+    """
+    if price < 200:
+        tick = 1
+    elif price < 500:
+        tick = 2
+    elif price < 2000:
+        tick = 5
+    elif price < 5000:
+        tick = 10
+    else:
+        tick = 25
+        
+    return int(round(price / tick) * tick)
+
 def evaluate_trade_risk(
     total_capital: float,
     max_risk_percentage: float,
@@ -35,8 +58,11 @@ def evaluate_trade_risk(
     - max_allocation_percentage (float): Batas alokasi modal maksimal untuk satu saham (default: 25% = 0.25).
     """
     # 1. Konversi prediksi persentase menjadi level harga nominal target
-    expected_tp_price = entry_price * (1 + pred_return)
-    expected_sl_price = entry_price * (1 + pred_risk)  # pred_risk negatif, misal 1 + (-0.03) = 0.97
+    raw_tp = entry_price * (1 + pred_return)
+    raw_sl = entry_price * (1 + pred_risk)  # pred_risk negatif, misal 1 + (-0.03) = 0.97
+    
+    expected_tp_price = float(round_to_idx_tick(raw_tp))
+    expected_sl_price = float(round_to_idx_tick(raw_sl))
     
     # 2. Hitung biaya riil transaksi (Cost Basis vs Net Exit) untuk akurasi net-profit
     cost_basis_per_share = entry_price * (1 + fee_buy)

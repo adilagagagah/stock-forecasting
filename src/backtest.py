@@ -180,6 +180,7 @@ class WalkForwardBacktester:
                 self.equity_curve.append({
                     'date': current_date,
                     'cash': self.current_capital,
+                    'invested': active_value,
                     'total_equity': self.current_capital + active_value,
                     'active_positions': len(self.active_trades)
                 })
@@ -356,13 +357,16 @@ class WalkForwardBacktester:
         journal['Harga Eksekusi'] = 0.0
         journal['Lot'] = 0
         journal['Value Transaksi'] = 0.0
-        journal['Sisa Equity'] = 0.0
+        journal['Invested'] = 0.0
+        journal['Sisa Cash'] = 0.0
         journal['Total Equity'] = 0.0
         
         # Mapping data dari equity_curve
         df_eq = pd.DataFrame(self.equity_curve).set_index('date')
         if 'cash' in df_eq.columns:
-            journal['Sisa Equity'] = df_eq['cash']
+            journal['Sisa Cash'] = df_eq['cash']
+        if 'invested' in df_eq.columns:
+            journal['Invested'] = df_eq['invested']
         if 'total_equity' in df_eq.columns:
             journal['Total Equity'] = df_eq['total_equity']
             
@@ -401,18 +405,19 @@ class WalkForwardBacktester:
                 journal.at[entry_d, 'Value Transaksi'] = trade['capital_spent']
                 
         # Forward fill equity if any NaN
-        journal['Sisa Equity'] = journal['Sisa Equity'].ffill()
+        journal['Invested'] = journal['Invested'].ffill()
+        journal['Sisa Cash'] = journal['Sisa Cash'].ffill()
         journal['Total Equity'] = journal['Total Equity'].ffill()
         
-        # Reorder columns: 1-5 (OHLCV), 6-11 custom
-        cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'Keputusan', 'Harga Eksekusi', 'Lot', 'Value Transaksi', 'Sisa Equity', 'Total Equity']
+        # Reorder columns: 1-5 (OHLCV), 6-12 custom
+        cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'Keputusan', 'Harga Eksekusi', 'Lot', 'Value Transaksi', 'Invested', 'Sisa Cash', 'Total Equity']
         # If there are other existing columns, keep them at the end
         other_cols = [c for c in journal.columns if c not in cols]
         
         final_journal = journal[cols + other_cols].copy()
         
         # Format nilai ke dalam standar ribuan/jutaan dengan koma
-        format_float = ['Open', 'High', 'Low', 'Close', 'Harga Eksekusi', 'Value Transaksi', 'Sisa Equity', 'Total Equity']
+        format_float = ['Open', 'High', 'Low', 'Close', 'Harga Eksekusi', 'Value Transaksi', 'Invested', 'Sisa Cash', 'Total Equity']
         format_int = ['Volume', 'Lot']
         
         for col in format_float:
