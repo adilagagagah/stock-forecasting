@@ -61,7 +61,7 @@ def calculate_technical_indicators(df: pd.DataFrame, period: int = 14) -> pd.Dat
     df['Dist_to_MA20'] = ((df['Close'] - ma20) / ma20).shift(1) # Geser 1 hari
 
     # 7. Volatilitas Harga Historis (Historical Volatility 5 Hari)
-    df['Hist_Volatility_5d'] = df['Log_Return'].rolling(window=5).std().shift(1)
+    df['Hist_Volatility_5d'] = log_return_raw.rolling(window=5).std().shift(1)
     
     return df
 
@@ -113,11 +113,12 @@ def detect_support_resistance(df: pd.DataFrame, window: int = 20) -> pd.DataFram
         elif close_yesterday > resistance_yesterday:
             df.loc[df.index[i], 'Support'] = resistance_yesterday
 
+    close_yesterday = df['Close'].shift(1)
     # Bersihkan NaN awal dan hapus kolom temporary
-    df['distance_to_support'] = ((df['Open'] - df['Support_Zone_High']) / (df['Support_Zone_High'] + 1e-9)) * 100
-    df['distance_to_resistance'] = ((df['Resistance_Zone_Low'] - df['Open']) / (df['Open'] + 1e-9)) * 100
-    # df['distance_to_support'] = df['Open'] - df['Support_Zone_High']
-    # df['distance_to_resistance'] = df['Resistance_Zone_Low'] - df['Open']
+    df['distance_to_support'] = ((close_yesterday - df['Support_Zone_High']) / (df['Support_Zone_High'] + 1e-9)) * 100
+    df['distance_to_resistance'] = ((df['Resistance_Zone_Low'] - close_yesterday) / (close_yesterday + 1e-9)) * 100
+    # df['distance_to_support'] = close_yesterday - df['Support_Zone_High']
+    # df['distance_to_resistance'] = df['Resistance_Zone_Low'] - close_yesterday
 
     # Lakukan ffill dan bfill untuk membersihkan NaN jika ada pembagi nol
     df['distance_to_support'] = df['distance_to_support'].ffill().bfill()

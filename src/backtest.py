@@ -85,10 +85,25 @@ class WalkForwardBacktester:
         """
         Eksekutor utama siklus Walk-Forward Analysis (WFA) pada periode Out-of-Sample.
         """
+        # Reset state agar bisa dijalankan berulang kali dengan instance yang sama
+        self.current_capital = self.initial_capital
+        self.active_trades = []
+        self.trade_history = []
+        self.equity_curve = []
+        self.daily_predictions = []
+
         print("=" * 70)
         print(f" MEMULAI SIMULASI WALK-FORWARD ANALYSIS ({self.ticker})")
         print(f" Modal Awal: Rp{self.initial_capital:,.2f}")
         print("=" * 70)
+
+        # Hitung kondisi uptrend: EMA 5 > EMA 10 > EMA 20 selama 10 hari berturut-turut
+        ema5 = df_raw_prices['Close'].ewm(span=5, adjust=False).mean()
+        ema10 = df_raw_prices['Close'].ewm(span=10, adjust=False).mean()
+        ema20 = df_raw_prices['Close'].ewm(span=20, adjust=False).mean()
+        daily_uptrend = (ema5 > ema10) & (ema10 > ema20)
+        # Geser mundur satu hari agar kondisi diketahui saat open market hari T
+        uptrend_series = (daily_uptrend.rolling(window=10).sum() == 10).shift(1).fillna(False)
 
         # Muat model awal dari folder models/
         ticker_name = self.ticker.split('.')[0].lower()
@@ -140,6 +155,8 @@ class WalkForwardBacktester:
 
                 # B.2 RISK MANAGER EVALUATION: Hitung kelayakan transaksi & position sizing
                 entry_price_today = df_raw_prices.loc[current_date, 'Open']
+                # Cek apakah hari ini sedang dalam regime uptrend
+                is_uptrend_today = bool(uptrend_series.loc[current_date]) if current_date in uptrend_series.index else False
                 
                 risk_eval = evaluate_trade_risk(
                     total_capital=self.current_capital,
@@ -153,7 +170,8 @@ class WalkForwardBacktester:
                     fee_buy=self.fee_buy,
                     fee_sell=self.fee_sell,
                     min_rr_ratio=self.min_rr_ratio,
-                    max_allocation_percentage=self.max_alloc_pct
+                    max_allocation_percentage=self.max_alloc_pct,
+                    is_uptrend=is_uptrend_today
                 )
 
                 # B.3 EXECUTION ENGINE (OPENING): Beli di harga Open jika disetujui (Maks 1 posisi)
@@ -161,7 +179,7 @@ class WalkForwardBacktester:
                     self._execute_buy_order(current_date, risk_eval, preds)
 
                 # B.4 END-OF-DAY EVALUATION: Cek Exit (TP, SL, Time-Stop) untuk posisi aktif
-                self._process_active_exits(current_date, df_raw_prices)
+                self._process_active_exits(current_date, df_raw_prices, is_uptrend=is_uptrend_today)
 
                 # Simpan Prediksi Harian
                 self.daily_predictions.append({
@@ -235,8 +253,9 @@ class WalkForwardBacktester:
         self.active_trades.append(trade)
         total_equity = self.current_capital + capital_needed
         print(f"  [BUY LOG]  {date.date()} | Beli                 @ Rp{trade['entry_price']:<7,.2f} | Lot: {trade['lots']:<4} | Modal : Rp{capital_needed:>10,.2f}            | Ekuitas: Rp{total_equity:>12,.2f}")
+        print(f"             [REASON] Slope: {preds['trend_slope']:.4f} | Ret: {preds['return']*100:.2f}% | Risk: {preds['risk']*100:.2f}% | RR: {risk_eval['actual_rr_ratio']:.2f}")
 
-    def _process_active_exits(self, current_date, df_raw_prices: pd.DataFrame, force_close: bool = False):
+    def _process_active_exits(self, current_date, df_raw_prices: pd.DataFrame, force_close: bool = False, is_uptrend: bool = False):
         """Mengevaluasi Hard-Exit (TP, SL, Time-Stop) pada akhir hari bursa"""
         if not self.active_trades or current_date not in df_raw_prices.index:
             return
@@ -254,8 +273,13 @@ class WalkForwardBacktester:
             
             # Logika Pemicu Exit (Hard-Exit Rules)
             hit_tp = high_price >= trade['tp_price']
-            hit_sl = low_price <= trade['sl_price']
-            hit_time_stop = trade['days_held'] >= trade['max_holding_days']
+            
+            if is_uptrend:
+                hit_sl = low_price <= trade['sl_price'] * 0.75
+                hit_time_stop = trade['days_held'] >= 10
+            else:
+                hit_sl = low_price <= trade['sl_price']
+                hit_time_stop = trade['days_held'] >= trade['max_holding_days']
 
             if hit_tp or hit_sl or hit_time_stop or force_close:
                 # Penentuan Harga Jual Realistis

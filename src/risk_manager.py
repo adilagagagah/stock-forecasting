@@ -36,7 +36,8 @@ def evaluate_trade_risk(
     fee_buy: float = 0.0015,
     fee_sell: float = 0.0025,
     min_rr_ratio: float = 2.0,
-    max_allocation_percentage: float = 0.25
+    max_allocation_percentage: float = 0.25,
+    is_uptrend: bool = False
 ) -> Dict[str, Any]:
     """
     Sistem Manajemen Risiko Kuantitatif Profesional.
@@ -56,7 +57,14 @@ def evaluate_trade_risk(
     - fee_sell (float): Persentase biaya jual aplikasi (default: 0.25% = 0.0025).
     - min_rr_ratio (float): Standar minimal Rasio Risk-to-Reward (default: 2.0).
     - max_allocation_percentage (float): Batas alokasi modal maksimal untuk satu saham (default: 25% = 0.25).
+    - is_uptrend (bool): Status apakah pasar saat ini dalam kondisi uptrend yang kuat.
     """
+    # 0. Sesuaikan toleransi risiko dan kemiringan tren berdasarkan rezim pasar
+    if is_uptrend:
+        min_trend_slope = 0.0
+    else:
+        min_trend_slope = 0.008
+
     # 1. Konversi prediksi persentase menjadi level harga nominal target
     raw_tp = entry_price * (1 + pred_return)
     raw_sl = entry_price * (1 + pred_risk)  # pred_risk negatif, misal 1 + (-0.03) = 0.97
@@ -100,7 +108,7 @@ def evaluate_trade_risk(
     
     # 5. Filter Keputusan Eksekusi Transaksi Berlapislah
     # Transaksi disetujui HANYA JIKA tren diprediksi naik DAN rasio RR net-fee memenuhi standar minimum
-    execute_trade = (pred_trend_slope > 0) and (actual_rr_ratio >= min_rr_ratio) and (final_lots_to_buy > 0)
+    execute_trade = (pred_trend_slope > min_trend_slope) and (actual_rr_ratio >= min_rr_ratio) and (final_lots_to_buy > 0)
     
     # 6. Penyusunan Rencana Aksi Strategis berbasis Waktu (Days to Max / Min)
     action_plan = "TIDAK ADA AKSI (Sistem memblokir transaksi karena risiko buruk)."
