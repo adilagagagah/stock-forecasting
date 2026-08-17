@@ -1,3 +1,29 @@
+import os
+import random
+import numpy as np
+
+# --- PENGUNCIAN RANDOM SEED GLOBALLY (UNTUK REPRODUCIBILITY) ---
+# Memastikan TabNet (PyTorch) dan LSTM/GRU/TCN (TensorFlow) menghasilkan output yang sama setiap kali di-run.
+SEED = 42
+os.environ['PYTHONHASHSEED'] = str(SEED)
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+random.seed(SEED)
+np.random.seed(SEED)
+
+import tensorflow as tf
+tf.random.set_seed(SEED)
+
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+except ImportError:
+    pass
+
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import Ridge, PoissonRegressor, ElasticNet
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
@@ -8,7 +34,6 @@ from sklearn.neighbors import KNeighborsRegressor
 from catboost import CatBoostRegressor
 from ngboost import NGBRegressor
 from pytorch_tabnet.tab_model import TabNetRegressor
-import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import LSTM, GRU, Dense, Input, Dropout, LayerNormalization, MultiHeadAttention
 from tcn import TCN # dari keras-tcn

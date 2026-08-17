@@ -8,6 +8,26 @@ from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
+from scikeras.wrappers import KerasRegressor
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class StandardScaler3D(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.scaler = StandardScaler()
+        
+    def fit(self, X, y=None):
+        if X.ndim == 3:
+            n, t, f = X.shape
+            self.scaler.fit(X.reshape(-1, f))
+        else:
+            self.scaler.fit(X)
+        return self
+        
+    def transform(self, X):
+        if X.ndim == 3:
+            n, t, f = X.shape
+            return self.scaler.transform(X.reshape(-1, f)).reshape(n, t, f)
+        return self.scaler.transform(X)
 
 class TargetModellingPipeline:
     def __init__(self, target_name: str, feature_cols: list, n_splits=5):
@@ -33,12 +53,30 @@ class TargetModellingPipeline:
 
     def tune_and_fit(self, X, y, model_instance, param_grid: dict):
         """ Runs GridSearch menggunakan TimeSeriesSplit untuk menghindari data leakage """
-        # Bungkus dengan Pipeline untuk memastikan scaling terjadi per fold CV
-        pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('model', model_instance)
-        ])
+        is_keras_3d = getattr(model_instance, 'model', None) is not None and model_instance.__class__.__name__ == 'KerasRegressor'
         
+        if is_keras_3d:
+            # Ubah data 2D menjadi 3D secara sliding window (mundur 10 hari)
+            timesteps = 10
+            X_new, y_new = [], []
+            for i in range(len(X) - timesteps + 1):
+                X_new.append(X[i:i+timesteps])
+                y_new.append(y[i+timesteps-1])
+            X_model = np.array(X_new)
+            y_model = np.array(y_new)
+            
+            pipeline = Pipeline([
+                ('scaler', StandardScaler3D()),
+                ('model', model_instance)
+            ])
+        else:
+            X_model = X
+            y_model = y
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('model', model_instance)
+            ])
+            
         # Sesuaikan key param_grid agar cocok dengan penamaan di dalam Pipeline ('model__')
         adjusted_grid = {f"model__{k}": v for k, v in param_grid.items()}
         
@@ -55,9 +93,9 @@ class TargetModellingPipeline:
         
         # Penanganan khusus: TabNet mewajibkan target (y) berbentuk 2D
         if model_instance.__class__.__name__ == 'TabNetRegressor':
-            y = y.reshape(-1, 1)
+            y_model = y_model.reshape(-1, 1)
 
-        grid_search.fit(X, y)
+        grid_search.fit(X_model, y_model)
         
         # Simpan objek pipeline terbaik hasil tuning
         self.best_pipeline = grid_search.best_estimator_
@@ -70,10 +108,10 @@ class TargetModellingPipeline:
         val_mae = -grid_search.best_score_
         
         # Train_MAE & Train_R2: Error murni pada data yang dilihatnya (In-Sample)
-        pure_train_preds = self.best_pipeline.predict(X)
+        pure_train_preds = self.best_pipeline.predict(X_model)
         
         # Ratakan dimensi y dan preds ke 1D untuk memastikan kalkulasi metrik aman (terutama untuk TabNet)
-        y_eval = y.ravel()
+        y_eval = y_model.ravel()
         preds_eval = pure_train_preds.ravel()
         
         train_mae = mean_absolute_error(y_eval, preds_eval)
@@ -216,6 +254,7 @@ class ModelEvaluator:
         if sorted_challengers.empty:
             raise ValueError("Tidak ada model penantang yang tersedia untuk dievaluasi.")
 
+        skipped_models = []
         for index, row in sorted_challengers.iterrows():
             c_train_mae = row['Train_MAE']
             c_val_mae = row['Val_MAE']
@@ -225,11 +264,16 @@ class ModelEvaluator:
             
             # Jika menemukan yang Good Fit, langsung kembalikan baris tersebut dan hentikan pencarian
             if status == "Good Fit":
-                return row
+                reason = "Memiliki skor metrik prioritas tertinggi DAN berstatus 'Good Fit' (tidak overfitting)."
+                if skipped_models:
+                    reason += f" Sistem mendiskualifikasi ({', '.join(skipped_models)}) karena statusnya Overfit."
+                return row, reason
+            else:
+                skipped_models.append(row['Model'])
                 
         # Fallback: Jika loop selesai dan tidak ada yang 'Good Fit', ambil peringkat 1
         best_fallback_data = sorted_challengers.iloc[0]
-        return best_fallback_data
+        return best_fallback_data, "Semua model berstatus Overfit. Memaksa memilih model peringkat ke-1 sebagai fallback (Harap waspada)."
 
     def _make_decision(self, c_hit_rate, bl_hit_rate, c_val_mae, bl_val_mae, fit_status):
         """Menentukan apakah model lolos mengalahkan baseline"""
@@ -248,7 +292,7 @@ class ModelEvaluator:
         """Method utama untuk mengeksekusi seluruh logika evaluasi dan mengembalikan dictionary laporan"""
         baseline_data = df_results[df_results['Model'] == self.baseline_name].iloc[0]
         sorted_challengers = self._sort_challengers(df_results)
-        best_challenger_data = self._select_optimal_challenger(sorted_challengers)
+        best_challenger_data, selection_reason = self._select_optimal_challenger(sorted_challengers)
 
         c_train_mae = best_challenger_data['Train_MAE']
         c_val_mae = best_challenger_data['Val_MAE']
@@ -269,10 +313,14 @@ class ModelEvaluator:
             final_model = best_challenger_data['Model']
             best_hit_rate = c_hit_rate
             final_fit_status = challenger_fit_status
+            final_reason = selection_reason
         else:
             final_model = baseline_data['Model']
             best_hit_rate = bl_hit_rate
             final_fit_status = baseline_fit_status
+            final_reason = "Model penantang gagal mengalahkan Baseline (Kalah metrik dasar)."
+
+        metric_priority = "Hit Rate terbesar -> Val MAE terkecil" if self.target_name in ['return', 'trend_slope'] else "Val MAE terkecil -> Hit Rate terbesar"
 
         return {
             'Target': self.target_name,
@@ -285,5 +333,7 @@ class ModelEvaluator:
             'Keputusan': decision,
             'Model Terpilih': final_model,
             'Best Hit Rate': f"{round(best_hit_rate, 2)}%",
-            'Fit Status': final_fit_status
+            'Fit Status': final_fit_status,
+            'Prioritas Seleksi': metric_priority,
+            'Alasan Pemilihan': final_reason
         }

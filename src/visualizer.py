@@ -170,7 +170,7 @@ def comparison_chart(first_data_list=[], second_data_list=[],
     plt.suptitle(suptitle, fontsize=16, fontweight='bold', y=1.06)
     plt.show()
 
-def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date: str = None, end_date: str = None, predictions_df: pd.DataFrame = None, equity_curve_df: pd.DataFrame = None, trades_df: pd.DataFrame = None):
+def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date: str = None, end_date: str = None, predictions_df: pd.DataFrame = None, equity_curve_df: pd.DataFrame = None, trades_df: pd.DataFrame = None, show_raw_buy_signals: bool = False):
     """
     Membuat grafik candlestick interaktif menggunakan Plotly.
     Sangat cocok digunakan di dalam Jupyter Notebook untuk zoom dan pan.
@@ -244,7 +244,31 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
     if predictions_df is not None and not predictions_df.empty:
         pred_df = predictions_df.reindex(df.index)
         
-        # 1. (Dihapus: Sinyal beli sekarang diplot dari trades_df agar data selaras)
+        # 1. Plot Sinyal Mentah (Debug) dari Model Murni (Jika diaktifkan)
+        if show_raw_buy_signals and 'raw_buy_signal' in pred_df.columns:
+            raw_signals = pred_df[pred_df['raw_buy_signal'] == True]
+            if not raw_signals.empty:
+                # Letakkan marker panah sedikit di bawah harga Low
+                signal_prices = df.loc[raw_signals.index, 'Low'] * 0.98
+                
+                # Susun data hasil prediksi untuk ditampilkan di hover
+                hover_data = raw_signals[['pred_return', 'pred_risk', 'actual_rr_ratio', 'pred_trend_slope', 'pred_days_to_max', 'pred_days_to_min']].values
+                
+                fig.add_trace(go.Scatter(
+                    x=raw_signals.index, y=signal_prices, mode='markers',
+                    customdata=hover_data,
+                    marker=dict(symbol='triangle-up', size=14, color='magenta', line=dict(width=1, color='darkmagenta')),
+                    name='RAW Model Buy Signal (Debug)', 
+                    hovertemplate=(
+                        '<b>Sinyal Mentah (Model Jenuh Jual)</b><br>' +
+                        'Return Pred: %{customdata[0]:.2%}<br>' +
+                        'Risk Pred: %{customdata[1]:.2%}<br>' +
+                        'RR Ratio: %{customdata[2]:.2f}<br>' +
+                        'Trend Slope: %{customdata[3]:.2%}<br>' +
+                        'T+ (Max/Min): %{customdata[4]:.0f} Hari / %{customdata[5]:.0f} Hari' +
+                        '<extra></extra>'
+                    )
+                ), row=1, col=1, secondary_y=False)
                 
         # 2. Plot Prediksi RR, Return & Risk di Sumbu Y Sekunder
         if 'actual_rr_ratio' in pred_df.columns:

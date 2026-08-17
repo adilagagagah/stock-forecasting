@@ -107,8 +107,11 @@ def evaluate_trade_risk(
     final_capital_spent = final_lots_to_buy * 100 * cost_basis_per_share
     
     # 5. Filter Keputusan Eksekusi Transaksi Berlapislah
-    # Transaksi disetujui HANYA JIKA tren diprediksi naik DAN rasio RR net-fee memenuhi standar minimum
-    execute_trade = (pred_trend_slope > min_trend_slope) and (actual_rr_ratio >= min_rr_ratio) and (final_lots_to_buy > 0)
+    # Sinyal mentah (Debug Only): Hanya bergantung pada model murni (tanpa batasan lot/modal)
+    raw_buy_signal = (pred_trend_slope >= min_trend_slope) and (actual_rr_ratio >= min_rr_ratio)
+    
+    # Transaksi dieksekusi HANYA JIKA sinyal mentah True DAN alokasi lot tersedia
+    execute_trade = raw_buy_signal and (final_lots_to_buy > 0)
     
     # 6. Penyusunan Rencana Aksi Strategis berbasis Waktu (Days to Max / Min)
     action_plan = "TIDAK ADA AKSI (Sistem memblokir transaksi karena risiko buruk)."
@@ -137,6 +140,7 @@ def evaluate_trade_risk(
 
     return {
         "execute_trade": execute_trade,
+        "raw_buy_signal": raw_buy_signal,
         "action_plan": action_plan,
         "entry_price_raw": round(entry_price, 2),
         "cost_basis_inc_fee": round(cost_basis_per_share, 2),

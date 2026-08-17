@@ -125,6 +125,9 @@ class WalkForwardBacktester:
         X_train_current = X_in.copy()
         y_train_current = {k: v.copy() for k, v in y_in_dict.items()}
 
+        # Gabungkan seluruh fitur X untuk kemudahan melakukan slicing mundur (T-9 s.d T+0) pada model 3D
+        self.X_full = pd.concat([X_in, X_oos])
+
         # Grouping data Out-of-Sample (2024-2025) berdasarkan Tahun dan Bulan
         oos_period_months = X_oos.groupby([X_oos.index.year, X_oos.index.month])
 
@@ -150,7 +153,19 @@ class WalkForwardBacktester:
                 
                 for target in self.targets:
                     target_features = self.features_used[target]
-                    feature_vector = daily_row[target_features].values.reshape(1, -1)
+                    
+                    # Cek apakah arsitektur model mendukung 3 Dimensi (seperti LSTM/GRU/TCN)
+                    pipeline_model = self.trained_pipelines[target].named_steps['model']
+                    is_keras_3d = pipeline_model.__class__.__name__ == 'KerasRegressor'
+                    
+                    if is_keras_3d:
+                        # Ambil 10 hari ke belakang (T-9 s.d T+0) dari kalender full
+                        window_df = self.X_full.loc[:current_date].iloc[-10:]
+                        feature_vector = window_df[target_features].values.reshape(1, 10, -1)
+                    else:
+                        # Model tabular konvensional (2D)
+                        feature_vector = daily_row[target_features].values.reshape(1, -1)
+                        
                     preds[target] = self.trained_pipelines[target].predict(feature_vector)[0]
 
                 # B.2 RISK MANAGER EVALUATION: Hitung kelayakan transaksi & position sizing
@@ -190,7 +205,8 @@ class WalkForwardBacktester:
                     'pred_days_to_max': preds['days_to_max'],
                     'pred_days_to_min': preds['days_to_min'],
                     'actual_rr_ratio': risk_eval['actual_rr_ratio'],
-                    'signal_buy': risk_eval['execute_trade']
+                    'signal_buy': risk_eval['execute_trade'],
+                    'raw_buy_signal': risk_eval['raw_buy_signal']
                 })
 
                 # Record Ekuitas Harian
