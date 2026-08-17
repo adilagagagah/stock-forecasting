@@ -53,6 +53,10 @@ class TargetModellingPipeline:
             verbose=0
         )
         
+        # Penanganan khusus: TabNet mewajibkan target (y) berbentuk 2D
+        if model_instance.__class__.__name__ == 'TabNetRegressor':
+            y = y.reshape(-1, 1)
+
         grid_search.fit(X, y)
         
         # Simpan objek pipeline terbaik hasil tuning
@@ -67,32 +71,34 @@ class TargetModellingPipeline:
         
         # Train_MAE & Train_R2: Error murni pada data yang dilihatnya (In-Sample)
         pure_train_preds = self.best_pipeline.predict(X)
-        train_mae = mean_absolute_error(y, pure_train_preds)
-        train_r2 = r2_score(y, pure_train_preds)
+        
+        # Ratakan dimensi y dan preds ke 1D untuk memastikan kalkulasi metrik aman (terutama untuk TabNet)
+        y_eval = y.ravel()
+        preds_eval = pure_train_preds.ravel()
+        
+        train_mae = mean_absolute_error(y_eval, preds_eval)
+        train_r2 = r2_score(y_eval, preds_eval)
 
         # DIRECTIONAL ACCURACY (Hit Rate) - Sangat Krusial untuk Trading!
         # Menghitung seberapa sering model benar menebak arah (Naik/Turun)
-        # Mengabaikan target yang nilainya 0 untuk menghindari bias
         if self.target_name == 'trend_slope':
-            # Target Tren: Hit Rate diukur dari kesamaan arah (Positif=Naik, Negatif=Turun)
-            valid_idx = y != 0
+            valid_idx = y_eval != 0
             if valid_idx.sum() > 0:
-                correct = np.sign(y[valid_idx]) == np.sign(pure_train_preds[valid_idx])
+                correct = np.sign(y_eval[valid_idx]) == np.sign(preds_eval[valid_idx])
                 hit_rate = np.mean(correct) * 100
             else:
                 hit_rate = 0.0
         elif 'days_to_' in self.target_name:
-            # Target Waktu: Hit Rate diukur jika tebakan meleset MAKSIMAL 1 hari (Toleransi ketat)
-            pred_rounded = np.clip(np.round(pure_train_preds), 1, 5)
-            correct = np.abs(y - pred_rounded) <= 1
+            pred_rounded = np.clip(np.round(preds_eval), 1, 5)
+            correct = np.abs(y_eval - pred_rounded) <= 1
             hit_rate = np.mean(correct) * 100
         elif self.target_name == 'return':
             # BAGUS: Kenyataan (y) LEBIH TINGGI atau SAMA DENGAN Prediksi (dikurangi toleransi meleset 1%)
             # Cth: Pred 2%, Aktual 5% -> 5% >= (2% - 1%) -> TRUE (Take Profit Tersentuh)
             # Cth: Pred 5%, Aktual 1% -> 1% >= (5% - 1%) -> FALSE (Gagal)
-            valid_preds = pure_train_preds > 0 # Hanya hitung jika model menyuruh beli (prediksi positif)
+            valid_preds = preds_eval > 0 # Hanya hitung jika model menyuruh beli (prediksi positif)
             if valid_preds.sum() > 0:
-                correct = y[valid_preds] >= (pure_train_preds[valid_preds] - 0.01)
+                correct = y_eval[valid_preds] >= (preds_eval[valid_preds] - 0.01)
                 hit_rate = np.mean(correct) * 100
             else:
                 hit_rate = 0.0     
@@ -100,9 +106,9 @@ class TargetModellingPipeline:
             # BAGUS: Kenyataan (y) TIDAK LEBIH DALAM dari Prediksi (ditambah toleransi 1%)
             # Cth: Pred -5%, Aktual -3% -> -3% >= (-5% - 1%) -> TRUE (Stop Loss Aman)
             # Cth: Pred -5%, Aktual -10% -> -10% >= (-5% - 1%) -> FALSE (Stop Loss Jebol)
-            valid_preds = pure_train_preds < 0 # Hanya hitung prediksi penurunan
+            valid_preds = preds_eval < 0 # Hanya hitung prediksi penurunan
             if valid_preds.sum() > 0:
-                correct = y[valid_preds] >= (pure_train_preds[valid_preds] - 0.01)
+                correct = y_eval[valid_preds] >= (preds_eval[valid_preds] - 0.01)
                 hit_rate = np.mean(correct) * 100
             else:
                 hit_rate = 0.0

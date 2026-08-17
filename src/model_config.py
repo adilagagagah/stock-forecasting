@@ -16,7 +16,8 @@ from scikeras.wrappers import KerasRegressor
 
 FEATURES = [
     'ATR', 'RSI', 'Volume_Ratio', 'Log_Return', 'distance_to_support', 'distance_to_resistance',
-    'MACD_Hist', 'Dist_to_MA20', 'Hist_Volatility_5d'
+    'MACD_Hist', 'Dist_to_MA20', 'Hist_Volatility_5d',
+    'RSI_3', 'BB_Pct', 'Capitulation_Vol', 'Lower_Shadow_Pct', 'Upper_Shadow_Pct', 'Body_Pct', 'Williams_R'
 ]
 
 TARGET = ['return', 'risk', 'trend_slope', 'days_to_max', 'days_to_min']

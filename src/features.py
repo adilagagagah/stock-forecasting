@@ -130,10 +130,63 @@ def detect_support_resistance(df: pd.DataFrame, window: int = 20) -> pd.DataFram
     
     return df
 
+def calculate_climax_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Menghitung fitur khusus untuk mendeteksi fase 'Jenuh Jual' (Selling Climax)
+    dan penolakan harga (Rejection). Semua di-shift(1) agar bebas data leakage.
+    """
+    df = df.copy()
+    
+    # 1. Short-Term RSI (RSI-3) - Sangat sensitif terhadap oversold ekstrim
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(span=3, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(span=3, adjust=False).mean()
+    rs = gain / (loss + 1e-9)
+    rsi_3_raw = 100 - (100 / (1 + rs))
+    df['RSI_3'] = rsi_3_raw.shift(1)
+    
+    # 2. Bollinger Bands %B (MA20 ± 2 StdDev) - Jarak ke luar pita bawah
+    ma20 = df['Close'].rolling(window=20).mean()
+    std20 = df['Close'].rolling(window=20).std()
+    upper_band = ma20 + (2 * std20)
+    lower_band = ma20 - (2 * std20)
+    bb_pct_raw = (df['Close'] - lower_band) / (upper_band - lower_band + 1e-9)
+    df['BB_Pct'] = bb_pct_raw.shift(1)
+    
+    # 3. Capitulation Volume (Volume Ratio x Log Return) - Panic selling
+    volume_ma20 = df['Volume'].rolling(window=20).mean()
+    volume_ratio_raw = df['Volume'] / (volume_ma20 + 1e-9)
+    log_return_raw = np.log(df['Close'] / df['Close'].shift(1))
+    capitulation_vol_raw = volume_ratio_raw * log_return_raw
+    df['Capitulation_Vol'] = capitulation_vol_raw.shift(1)
+    
+    # 4, 5, & 6. Proporsi Candlestick (Lower Shadow, Upper Shadow, Real Body)
+    # Daripada mendeteksi 1 pola baku (Hammer), kita ubah menjadi nilai persentase kontinu
+    high_low_range = df['High'] - df['Low'] + 1e-9
+    min_open_close = df[['Open', 'Close']].min(axis=1)
+    max_open_close = df[['Open', 'Close']].max(axis=1)
+    
+    lower_shadow_pct_raw = (min_open_close - df['Low']) / high_low_range
+    upper_shadow_pct_raw = (df['High'] - max_open_close) / high_low_range
+    body_pct_raw = (df['Close'] - df['Open']).abs() / high_low_range
+    
+    df['Lower_Shadow_Pct'] = lower_shadow_pct_raw.shift(1)
+    df['Upper_Shadow_Pct'] = upper_shadow_pct_raw.shift(1)
+    df['Body_Pct'] = body_pct_raw.shift(1)
+    
+    # 7. Williams %R (14) - Sensitif terhadap penutupan dekat harga terendah
+    highest_high = df['High'].rolling(window=14).max()
+    lowest_low = df['Low'].rolling(window=14).min()
+    williams_r_raw = -100 * ((highest_high - df['Close']) / (highest_high - lowest_low + 1e-9))
+    df['Williams_R'] = williams_r_raw.shift(1)
+    
+    return df
+
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_atr(df)
     df = calculate_technical_indicators(df)
     df = detect_support_resistance(df)
+    df = calculate_climax_features(df)
     return df
 
 # ------------------------------------------
