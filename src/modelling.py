@@ -337,3 +337,205 @@ class ModelEvaluator:
             'Prioritas Seleksi': metric_priority,
             'Alasan Pemilihan': final_reason
         }
+
+
+# ==============================================================================
+# PIPELINE KLASIFIKASI BINER (Buy the Dip Detector)
+# ==============================================================================
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+class ClassificationPipeline:
+    """
+    Pipeline untuk melatih, mengoptimasi (GridSearch), dan mengevaluasi
+    model klasifikasi biner (Buy the Dip Detector).
+    """
+    def __init__(self, target_name: str = 'is_buy_dip', feature_cols: list = None, n_splits=5):
+        self.target_name = target_name
+        self.feature_cols = feature_cols or []
+        self.n_splits = n_splits
+        
+        self.best_pipeline = None
+        self.model_name = None
+        self.best_params = None
+        self.metrics = {}
+
+    def prepare_data(self, df: pd.DataFrame):
+        """ Membersihkan NaN dan menyiapkan X (fitur) dan y (label biner) """
+        df_clean = df.dropna(subset=self.feature_cols + [self.target_name]).copy()
+        X = df_clean[self.feature_cols].values
+        y = df_clean[self.target_name].values.astype(int)
+        return X, y
+
+    def tune_and_fit(self, X, y, model_instance, param_grid: dict):
+        """
+        Runs GridSearch menggunakan TimeSeriesSplit.
+        Scoring: F1-Score (keseimbangan antara Precision dan Recall)
+        """
+        pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('model', model_instance)
+        ])
+        
+        adjusted_grid = {f"model__{k}": v for k, v in param_grid.items()}
+        
+        tscv = TimeSeriesSplit(n_splits=self.n_splits)
+        
+        grid_search = GridSearchCV(
+            pipeline, adjusted_grid, cv=tscv,
+            scoring='f1',
+            n_jobs=-1, verbose=0
+        )
+        
+        grid_search.fit(X, y)
+        
+        self.best_pipeline = grid_search.best_estimator_
+        self.model_name = model_instance.__class__.__name__
+        self.best_params = {k.replace('model__', ''): v for k, v in grid_search.best_params_.items()}
+        
+        # Metrik Validasi (Out-of-Fold)
+        val_f1 = grid_search.best_score_
+        
+        # Metrik Training (In-Sample)
+        train_preds = self.best_pipeline.predict(X)
+        train_precision = precision_score(y, train_preds, zero_division=0)
+        train_recall = recall_score(y, train_preds, zero_division=0)
+        train_f1 = f1_score(y, train_preds, zero_division=0)
+        
+        # Distribusi label
+        n_positive = int(y.sum())
+        n_total = len(y)
+        
+        print(f"   -> [HYPERPARAMETERS]: {self.best_params}")
+        print(f"   -> [LABEL DIST]: {n_positive}/{n_total} positif ({n_positive/n_total*100:.1f}%)")
+        print(f"   -> [TRAIN]: Precision {train_precision:.2%} | Recall {train_recall:.2%} | F1 {train_f1:.2%}")
+        print(f"   -> [VAL F1]: {val_f1:.2%}")
+        
+        self.metrics = {
+            'Train_Precision': round(train_precision * 100, 2),
+            'Train_Recall': round(train_recall * 100, 2),
+            'Train_F1': round(train_f1 * 100, 2),
+            'Val_F1': round(val_f1 * 100, 2),
+            'Label_Positive_Pct': round(n_positive / n_total * 100, 2)
+        }
+        
+        return self.best_pipeline
+
+    def save(self, folder_path: str, ticker: str = None):
+        """ Simpan model classifier beserta metadata lengkap ke dalam satu file .pkl """
+        if self.best_pipeline is None:
+            raise ValueError("Model belum dilatih.")
+
+        base_folder = Path(folder_path)
+        
+        if ticker:
+            target_folder = base_folder / ticker
+            filepath = target_folder / f"model_{self.target_name}_{ticker}.pkl"
+        else:
+            target_folder = base_folder
+            filepath = target_folder / f"model_{self.target_name}.pkl"
+        
+        target_folder.mkdir(parents=True, exist_ok=True)
+        
+        metadata_payload = {
+            'pipeline': self.best_pipeline,
+            'metadata': {
+                'model_name': self.model_name,
+                'target_name': self.target_name,
+                'best_params': self.best_params,
+                'in_sample_metrics': self.metrics,
+                'features_used': self.feature_cols,
+                'model_type': 'classifier',
+                'trained_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+        }
+        if ticker:
+            metadata_payload['metadata']['ticker'] = ticker
+        
+        joblib.dump(metadata_payload, filepath)
+        print(f"[SAVED] Berhasil mengekspor model classifier ke: {filepath.as_posix()}")
+
+
+class ClassificationEvaluator:
+    """
+    Evaluator untuk membandingkan model klasifikasi.
+    Mengurutkan model berdasarkan Val_F1, memilih yang Good Fit.
+    """
+    def __init__(self, baseline_name="DummyBaseline"):
+        self.baseline_name = baseline_name
+
+    def _sort_challengers(self, df_results):
+        """ Urutkan model penantang: Val_F1 tertinggi → Train_Precision tertinggi """
+        challenger_data = df_results[df_results['Model'] != self.baseline_name]
+        return challenger_data.sort_values(
+            by=['Val_F1', 'Train_Precision'], 
+            ascending=[False, False]
+        )
+
+    def _check_fit_status(self, train_f1, val_f1):
+        """ Overfit Detector khusus Classifier """
+        if train_f1 == 0 and val_f1 == 0:
+            return "Tidak Belajar (F1=0)"
+        if train_f1 > 0 and val_f1 == 0:
+            return "Overfit Parah (Val F1=0)"
+        
+        f1_degradation = (train_f1 - val_f1) / (train_f1 + 1e-9)
+        if f1_degradation > 0.40:
+            return "Overfitting (F1 Drop >40%)"
+        elif f1_degradation > 0.25:
+            return "Overfitting"
+        else:
+            return "Good Fit"
+
+    def _select_optimal_challenger(self, sorted_challengers):
+        """ Memilih model terbaik yang berstatus Good Fit """
+        if sorted_challengers.empty:
+            raise ValueError("Tidak ada model penantang yang tersedia.")
+
+        skipped_models = []
+        for _, row in sorted_challengers.iterrows():
+            status = self._check_fit_status(row['Train_F1'], row['Val_F1'])
+            
+            if status == "Good Fit":
+                reason = f"Val F1 tertinggi ({row['Val_F1']:.2f}%) DAN berstatus 'Good Fit'."
+                if skipped_models:
+                    reason += f" Sistem mendiskualifikasi ({', '.join(skipped_models)}) karena statusnya Overfit."
+                return row, reason
+            else:
+                skipped_models.append(row['Model'])
+                
+        best_fallback = sorted_challengers.iloc[0]
+        return best_fallback, "Semua model Overfit. Memilih peringkat ke-1 sebagai fallback."
+
+    def generate_evaluation_report(self, df_results):
+        """ Menghasilkan laporan evaluasi dan memilih model terbaik """
+        baseline_data = df_results[df_results['Model'] == self.baseline_name].iloc[0]
+        sorted_challengers = self._sort_challengers(df_results)
+        best_challenger, selection_reason = self._select_optimal_challenger(sorted_challengers)
+        
+        challenger_fit = self._check_fit_status(best_challenger['Train_F1'], best_challenger['Val_F1'])
+        baseline_fit = self._check_fit_status(baseline_data['Train_F1'], baseline_data['Val_F1'])
+        
+        # Keputusan: Challenger lolos jika Val_F1 > Baseline Val_F1
+        if best_challenger['Val_F1'] > baseline_data['Val_F1']:
+            decision = "Lolos" if challenger_fit == "Good Fit" else "Lolos (Awas Overfit)"
+            final_model = best_challenger['Model']
+            final_fit = challenger_fit
+            final_reason = selection_reason
+        else:
+            decision = "Gagal (Kalah F1 dari Baseline)"
+            final_model = baseline_data['Model']
+            final_fit = baseline_fit
+            final_reason = "Tidak ada model yang mengalahkan Baseline."
+
+        return {
+            'Target': 'is_buy_dip',
+            'Baseline Val_F1': f"{baseline_data['Val_F1']:.2f}%",
+            'Challenger Model': best_challenger['Model'],
+            'Challenger Val_F1': f"{best_challenger['Val_F1']:.2f}%",
+            'Challenger Precision': f"{best_challenger['Train_Precision']:.2f}%",
+            'Challenger Recall': f"{best_challenger['Train_Recall']:.2f}%",
+            'Keputusan': decision,
+            'Model Terpilih': final_model,
+            'Fit Status': final_fit,
+            'Alasan Pemilihan': final_reason
+        }

@@ -474,3 +474,377 @@ class WalkForwardBacktester:
             print(f"[INFO] Jurnal berhasil disimpan ke: {save_csv_path}")
             
         return final_journal
+
+
+# ==============================================================================
+# MESIN BACKTEST KLASIFIKASI (Buy the Dip Detector)
+# ==============================================================================
+import math
+
+class ClassifierBacktester:
+    """
+    Mesin Backtest Walk-Forward Analysis khusus model klasifikasi biner.
+    Model memprediksi 1 (Beli) atau 0 (Jangan Beli).
+    TP/SL ditentukan secara otomatis berbasis ATR (bukan dari prediksi regresi).
+    """
+    def __init__(
+        self,
+        ticker: str,
+        initial_capital: float = 5_000_000.0,
+        max_risk_pct: float = 0.02,
+        max_alloc_pct: float = 0.25,
+        fee_buy: float = 0.0015,
+        fee_sell: float = 0.0025,
+        atr_tp_multiplier: float = 2.0,
+        atr_sl_multiplier: float = 1.0,
+        max_holding_days: int = 5,
+        min_buy_proba: float = 0.50
+    ):
+        self.ticker = ticker
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.max_risk_pct = max_risk_pct
+        self.max_alloc_pct = max_alloc_pct
+        self.fee_buy = fee_buy
+        self.fee_sell = fee_sell
+        self.atr_tp_multiplier = atr_tp_multiplier
+        self.atr_sl_multiplier = atr_sl_multiplier
+        self.max_holding_days = max_holding_days
+        self.min_buy_proba = min_buy_proba
+
+        self.active_trades = []
+        self.trade_history = []
+        self.equity_curve = []
+        self.daily_predictions = []
+        self.predictions_df = None
+
+        self.trained_pipeline = None
+        self.features_used = []
+
+    def run_backtest(
+        self,
+        X_in: pd.DataFrame,
+        y_in: pd.Series,
+        X_oos: pd.DataFrame,
+        y_oos: pd.Series,
+        df_raw_prices: pd.DataFrame,
+        feature_cols: list
+    ):
+        """
+        Eksekutor utama Walk-Forward Analysis untuk model klasifikasi.
+        """
+        # Reset state
+        self.current_capital = self.initial_capital
+        self.active_trades = []
+        self.trade_history = []
+        self.equity_curve = []
+        self.daily_predictions = []
+
+        print("=" * 70)
+        print(f" SIMULASI CLASSIFIER BACKTEST ({self.ticker}) - Buy the Dip Detector")
+        print(f" Modal Awal: Rp{self.initial_capital:,.2f}")
+        print(f" TP/SL: +{self.atr_tp_multiplier}x ATR / -{self.atr_sl_multiplier}x ATR")
+        print("=" * 70)
+
+        # Muat model classifier awal
+        ticker_name = self.ticker.split('.')[0].lower()
+        model_path = os.path.join('..', 'models', ticker_name, f"model_is_buy_dip_{ticker_name}.pkl")
+        if not os.path.exists(model_path):
+            model_path = os.path.join('models', ticker_name, f"model_is_buy_dip_{ticker_name}.pkl")
+        
+        try:
+            payload = joblib.load(model_path)
+            self.trained_pipeline = payload['pipeline']
+            self.features_used = payload['metadata']['features_used']
+        except FileNotFoundError:
+            print(f"[ERROR] File model classifier tidak ditemukan di: {model_path}")
+            raise
+
+        # Inisialisasi data training expandable
+        X_train_current = X_in.copy()
+        y_train_current = y_in.copy()
+
+        # --- REGIME DETECTOR FILTER ---
+        # Deteksi Regime Menggunakan EMA 10, 20, 50 pada harga Close
+        ema10 = df_raw_prices['Close'].ewm(span=10, adjust=False).mean()
+        ema20 = df_raw_prices['Close'].ewm(span=20, adjust=False).mean()
+        ema50 = df_raw_prices['Close'].ewm(span=50, adjust=False).mean()
+        
+        regime_series = pd.Series(2, index=df_raw_prices.index) # Default: 2 (Sideways)
+        regime_series[(ema10 > ema20) & (ema20 > ema50)] = 1   # 1: Uptrend
+        regime_series[(ema10 < ema20) & (ema20 < ema50)] = 3   # 3: Downtrend
+        
+        # Shift 1 agar mencerminkan penutupan kemarin (diketahui pagi ini tanpa leakage)
+        regime_series = regime_series.shift(1).fillna(2).astype(int)
+
+        # Grouping OOS per bulan
+        oos_period_months = X_oos.groupby([X_oos.index.year, X_oos.index.month])
+        is_first_month = True
+
+        for (year, month), month_features in oos_period_months:
+            print("-" * 50)
+            print(f"PERIODE: {year}-{month:02d} | OOS: {len(month_features)} Hari Bursa")
+            print("-" * 50)
+
+            # A. RETRAIN bulanan
+            if not is_first_month:
+                self._retrain_model(X_train_current, y_train_current)
+            else:
+                print("[RETRAIN] Bulan pertama: menggunakan model awal tanpa retrain.")
+                is_first_month = False
+
+            # B. DAILY TRADING LOOP
+            for current_date, daily_row in month_features.iterrows():
+                # B.1 PREDIKSI: Apakah hari ini Buy the Dip?
+                feature_vector = daily_row[self.features_used].values.reshape(1, -1)
+                
+                # Ambil probabilitas jika model mendukungnya
+                try:
+                    proba = self.trained_pipeline.predict_proba(feature_vector)[0][1]
+                except:
+                    prediction = self.trained_pipeline.predict(feature_vector)[0]
+                    proba = float(prediction)
+                
+                # --- REGIME DETECTOR FILTER ---
+                current_regime = regime_series.loc[current_date] if current_date in regime_series.index else 2
+                
+                if current_regime == 1:
+                    # Regime 1: Uptrend (Beli Agresif)
+                    # Turunkan batas keyakinan model agar lebih sensitif
+                    adjusted_min_proba = max(0.1, self.min_buy_proba - 0.10)
+                elif current_regime == 3:
+                    # Regime 3: Downtrend (Dilarang Beli)
+                    # Mustahil tercapai agar transaksi diblokir mutlak
+                    adjusted_min_proba = 1.01 
+                else:
+                    # Regime 2: Sideways (Normal)
+                    adjusted_min_proba = self.min_buy_proba
+                
+                # Eksekusi bergantung pada probabilitas mutlak dan regime saat ini
+                is_buy_signal = proba >= adjusted_min_proba
+
+                # B.2 EKSEKUSI BELI (jika sinyal = True dan tidak ada posisi aktif)
+                if is_buy_signal and len(self.active_trades) == 0:
+                    entry_price = df_raw_prices.loc[current_date, 'Open']
+                    atr_value = daily_row['ATR'] if 'ATR' in daily_row.index else 0
+
+                    if atr_value > 0:
+                        self._execute_buy_order(current_date, entry_price, atr_value, current_regime)
+
+                # B.3 CEK EXIT untuk posisi aktif
+                self._process_active_exits(current_date, df_raw_prices)
+
+                # Simpan prediksi harian
+                self.daily_predictions.append({
+                    'date': current_date,
+                    'classifier_signal': is_buy_signal,
+                    'classifier_proba': round(proba, 4),
+                    'regime': current_regime,
+                    'signal_buy': is_buy_signal and len(self.active_trades) == 0
+                })
+
+                # Record ekuitas harian
+                active_value = sum(t['shares'] * df_raw_prices.loc[current_date, 'Close'] for t in self.active_trades)
+                self.equity_curve.append({
+                    'date': current_date,
+                    'cash': self.current_capital,
+                    'invested': active_value,
+                    'total_equity': self.current_capital + active_value,
+                    'active_positions': len(self.active_trades)
+                })
+
+            # C. EXPANDING WINDOW UPDATE
+            X_month_actual = month_features[feature_cols]
+            X_train_current = pd.concat([X_train_current, X_month_actual])
+            y_month_actual = y_oos.loc[month_features.index]
+            y_train_current = pd.concat([y_train_current, y_month_actual])
+
+        # Force close sisa posisi
+        if self.active_trades:
+            last_date = X_oos.index[-1]
+            print(f"\n[INFO] Menutup paksa {len(self.active_trades)} posisi di akhir backtest ({last_date.date()})")
+            self._process_active_exits(last_date, df_raw_prices, force_close=True)
+
+        # Konversi prediksi menjadi DataFrame
+        if self.daily_predictions:
+            self.predictions_df = pd.DataFrame(self.daily_predictions).set_index('date')
+            self.predictions_df.index = pd.to_datetime(self.predictions_df.index)
+
+        return self._summarize_performance()
+
+    def _retrain_model(self, X_train, y_train):
+        """ Melatih ulang model classifier dengan Expanding Window """
+        print(f"[RETRAIN] Melatih ulang classifier dengan {len(X_train)} baris data...")
+        X_clean = X_train[self.features_used].dropna()
+        y_clean = y_train.loc[X_clean.index].dropna()
+        common_idx = X_clean.index.intersection(y_clean.index)
+        X_clean = X_clean.loc[common_idx].values
+        y_clean = y_clean.loc[common_idx].values.astype(int)
+        
+        self.trained_pipeline.fit(X_clean, y_clean)
+        print("[RETRAIN] Model classifier berhasil diperbarui.\n")
+
+    def _execute_buy_order(self, date, entry_price, atr_value, current_regime=2):
+        """ Eksekusi pembelian dengan TP/SL berbasis ATR yang diadaptasi dengan Regime """
+        from src.risk_manager import round_to_idx_tick
+
+        active_tp_multiplier = self.atr_tp_multiplier
+        active_sl_multiplier = self.atr_sl_multiplier
+        
+        if current_regime == 1:
+            active_tp_multiplier = self.atr_tp_multiplier * 1.5
+            regime_name = "Uptrend"
+        elif current_regime == 3:
+            regime_name = "Downtrend"
+        else:
+            regime_name = "Sideways"
+
+        tp_price = float(round_to_idx_tick(entry_price + active_tp_multiplier * atr_value))
+        sl_price = float(round_to_idx_tick(entry_price - active_sl_multiplier * atr_value))
+        
+        cost_basis = entry_price * (1 + self.fee_buy)
+        actual_risk_per_share = cost_basis - sl_price * (1 - self.fee_sell)
+        
+        if actual_risk_per_share <= 0:
+            return
+
+        # Position Sizing
+        max_money_to_lose = self.current_capital * self.max_risk_pct
+        ideal_shares = max_money_to_lose / actual_risk_per_share
+        ideal_lots = math.floor(ideal_shares / 100)
+        
+        max_capital_alloc = self.current_capital * self.max_alloc_pct
+        required_capital = ideal_lots * 100 * cost_basis
+        
+        if required_capital > max_capital_alloc:
+            final_lots = math.floor(max_capital_alloc / (100 * cost_basis))
+        else:
+            final_lots = ideal_lots
+        
+        if final_lots <= 0:
+            return
+            
+        capital_needed = final_lots * 100 * cost_basis
+        
+        if capital_needed > self.current_capital:
+            return
+
+        self.current_capital -= capital_needed
+        
+        trade = {
+            'trade_id': len(self.trade_history) + len(self.active_trades) + 1,
+            'entry_date': date,
+            'entry_price': entry_price,
+            'cost_basis': cost_basis,
+            'lots': final_lots,
+            'shares': final_lots * 100,
+            'capital_spent': capital_needed,
+            'tp_price': tp_price,
+            'sl_price': sl_price,
+            'max_holding_days': self.max_holding_days,
+            'days_held': 0
+        }
+        
+        self.active_trades.append(trade)
+        total_equity = self.current_capital + capital_needed
+        print(f"  [BUY LOG]  {date.date()} | Beli [{regime_name:<8}] @ Rp{entry_price:<7,.2f} | Lot: {final_lots:<4} | Modal : Rp{capital_needed:>10,.2f}            | Ekuitas: Rp{total_equity:>12,.2f}")
+        print(f"             [ATR TP/SL] TP: Rp{tp_price:,.2f} | SL: Rp{sl_price:,.2f}")
+
+    def _process_active_exits(self, current_date, df_raw_prices, force_close=False):
+        """ Evaluasi exit berdasarkan TP/SL/Time-Stop """
+        if not self.active_trades or current_date not in df_raw_prices.index:
+            return
+
+        today_price = df_raw_prices.loc[current_date]
+        high_price = today_price['High']
+        low_price = today_price['Low']
+        close_price = today_price['Close']
+
+        for trade in self.active_trades[:]:
+            is_entry_day = (trade['entry_date'] == current_date)
+            
+            if not force_close and not is_entry_day:
+                trade['days_held'] += 1
+            
+            hit_tp = high_price >= trade['tp_price']
+            hit_sl = low_price <= trade['sl_price']
+            hit_time_stop = trade['days_held'] >= trade['max_holding_days']
+
+            if hit_tp or hit_sl or hit_time_stop or force_close:
+                if force_close:
+                    exit_price = close_price
+                    exit_reason = "Akhir Backtest"
+                elif hit_tp:
+                    exit_price = trade['tp_price']
+                    exit_reason = "Take Profit"
+                elif hit_sl:
+                    exit_price = trade['sl_price']
+                    exit_reason = "Stop Loss"
+                else:
+                    exit_price = close_price
+                    exit_reason = "Time-Stop"
+
+                gross_proceeds = trade['shares'] * exit_price
+                net_proceeds = gross_proceeds * (1 - self.fee_sell)
+                net_profit = net_proceeds - trade['capital_spent']
+                roi_pct = (net_profit / trade['capital_spent']) * 100
+
+                self.current_capital += net_proceeds
+                
+                active_value = sum(t['shares'] * close_price for t in self.active_trades if t != trade)
+                total_equity = self.current_capital + active_value
+
+                log_entry = {
+                    'trade_id': trade['trade_id'],
+                    'entry_date': trade['entry_date'],
+                    'exit_date': current_date,
+                    'entry_price': trade['entry_price'],
+                    'exit_price': exit_price,
+                    'lots': trade['lots'],
+                    'capital_spent': trade['capital_spent'],
+                    'net_proceeds': net_proceeds,
+                    'net_profit': net_profit,
+                    'roi_pct': roi_pct,
+                    'days_held': trade['days_held'],
+                    'exit_reason': exit_reason,
+                    'tp_price': trade['tp_price'],
+                    'sl_price': trade['sl_price']
+                }
+                
+                self.trade_history.append(log_entry)
+                self.active_trades.remove(trade)
+
+                print(f"  [SELL LOG] {current_date.date()} | Jual ({exit_reason:<12}) @ Rp{exit_price:<7,.2f} | Lot: {trade['lots']:<4} | Profit: Rp{net_profit:>10,.2f} ({roi_pct:>+6.2f}%) | Ekuitas: Rp{total_equity:>12,.2f}")
+
+    def _summarize_performance(self):
+        """ Ringkasan performa backtest classifier """
+        df_trades = pd.DataFrame(self.trade_history)
+        df_equity = pd.DataFrame(self.equity_curve)
+
+        if df_trades.empty:
+            print("\n[PERINGATAN] Tidak ada transaksi yang dieksekusi selama periode backtest.")
+            return None, df_equity
+
+        total_trades = len(df_trades)
+        winning_trades = df_trades[df_trades['net_profit'] > 0]
+        losing_trades = df_trades[df_trades['net_profit'] <= 0]
+
+        win_rate = (len(winning_trades) / total_trades) * 100
+        total_net_profit = df_trades['net_profit'].sum()
+        final_equity = self.current_capital
+        total_return_pct = ((final_equity - self.initial_capital) / self.initial_capital) * 100
+        expected_value = df_trades['net_profit'].mean()
+
+        print("\n" + "=" * 70)
+        print("        RINGKASAN PERFORMA CLASSIFIER BACKTEST (Buy the Dip)")
+        print("=" * 70)
+        print(f" Modal Awal            : Rp{self.initial_capital:,.2f}")
+        print(f" Modal Akhir           : Rp{final_equity:,.2f}")
+        print(f" Total Net Return      : Rp{total_net_profit:,.2f} ({total_return_pct:+.2f}%)")
+        print(f" Expected Value (EV)   : Rp{expected_value:,.2f} / trade")
+        print(f" Total Transaksi       : {total_trades}")
+        print(f" Win Rate              : {win_rate:.2f}% ({len(winning_trades)} Menang / {len(losing_trades)} Kalah)")
+        print(f" TP/SL Setting         : +{self.atr_tp_multiplier}x ATR / -{self.atr_sl_multiplier}x ATR")
+        print("=" * 70)
+
+        return df_trades, df_equity

@@ -182,11 +182,60 @@ def calculate_climax_features(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
+def calculate_macro_context_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fitur konteks makro & volatilitas untuk membantu model membedakan
+    'koreksi sehat' (dip) vs 'awal downtrend' (crash).
+
+    Semua di-shift(1) agar bebas dari data leakage.
+    
+    Fitur yang ditambahkan:
+    - Dist_to_MA50     : Jarak harga ke MA50 — apakah harga jauh di bawah MA50 (regime bearish)?
+    - EMA50_Slope      : Kemiringan EMA50 dalam 10 hari — apakah trend makro naik atau turun?
+    - ATR_Pct_Change   : Perubahan ATR dalam 5 hari — lonjakan tiba-tiba = kepanikan/crash
+    - BB_Width         : Lebar Bollinger Band (MA20 ± 2σ) — makin lebar = makin volatil
+    - Volume_Spike     : Volume hari ini vs rata-rata Volume 5 hari — lonjakan = selling pressure
+    """
+    df = df.copy()
+
+    # 1. Jarak ke MA50 — Regime Filter Jangka Menengah
+    ma50 = df['Close'].rolling(window=50).mean()
+    df['Dist_to_MA50'] = ((df['Close'] - ma50) / (ma50 + 1e-9)).shift(1)
+
+    # 2. Kemiringan EMA50 dalam 10 hari — Menangkap arah trend makro
+    ema50 = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA50_Slope'] = ((ema50 - ema50.shift(10)) / (ema50.shift(10) + 1e-9)).shift(1)
+
+    # 3. Perubahan ATR dalam 5 hari — Deteksi lonjakan volatilitas/kepanikan
+    if 'ATR' in df.columns:
+        atr_raw = df['ATR'].shift(-1)  # Ambil ATR sebelum dishift (nilai asli)
+    else:
+        high_low = df['High'] - df['Low']
+        high_close = (df['High'] - df['Close'].shift(1)).abs()
+        low_close = (df['Low'] - df['Close'].shift(1)).abs()
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr_raw = true_range.ewm(span=14, adjust=False).mean()
+    df['ATR_Pct_Change'] = (atr_raw.pct_change(periods=5)).shift(1)
+
+    # 4. Lebar Bollinger Band — Makin lebar = volatilitas makin tinggi
+    ma20 = df['Close'].rolling(window=20).mean()
+    std20 = df['Close'].rolling(window=20).std()
+    bb_width_raw = (2 * 2 * std20) / (ma20 + 1e-9)  # Lebar penuh = 4 std / MA20
+    df['BB_Width'] = bb_width_raw.shift(1)
+
+    # 5. Volume Spike vs MA5 — Lonjakan volume jangka pendek (tekanan jual mendadak)
+    vol_ma5 = df['Volume'].rolling(window=5).mean()
+    df['Volume_Spike'] = (df['Volume'] / (vol_ma5 + 1e-9)).shift(1)
+
+    return df
+
+
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_atr(df)
     df = calculate_technical_indicators(df)
     df = detect_support_resistance(df)
     df = calculate_climax_features(df)
+    df = calculate_macro_context_features(df)
     return df
 
 # ------------------------------------------
@@ -194,4 +243,4 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
 # enam_bulan_lalu = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
 # df_bumi = load_stock_data(ticker="BUMI.JK", start_date=enam_bulan_lalu, end_date=hari_ini)
 # df = calculate_technical_indicators(df_bumi)
-# print(df)
+# print(df)

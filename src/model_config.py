@@ -42,7 +42,8 @@ from scikeras.wrappers import KerasRegressor
 FEATURES = [
     'ATR', 'RSI', 'Volume_Ratio', 'Log_Return', 'distance_to_support', 'distance_to_resistance',
     'MACD_Hist', 'Dist_to_MA20', 'Hist_Volatility_5d',
-    'RSI_3', 'BB_Pct', 'Capitulation_Vol', 'Lower_Shadow_Pct', 'Upper_Shadow_Pct', 'Body_Pct', 'Williams_R'
+    'RSI_3', 'BB_Pct', 'Capitulation_Vol', 'Lower_Shadow_Pct', 'Upper_Shadow_Pct', 'Body_Pct', 'Williams_R',
+    'Dist_to_MA50', 'EMA50_Slope', 'ATR_Pct_Change', 'BB_Width', 'Volume_Spike'
 ]
 
 TARGET = ['return', 'risk', 'trend_slope', 'days_to_max', 'days_to_min']
@@ -241,4 +242,52 @@ MODEL_CONFIGS = {
         'data_format': '3d'
     }
     
+}
+
+
+# ==============================================================================
+# KONFIGURASI MODEL KLASIFIKASI (Buy the Dip Detector)
+# ==============================================================================
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.svm import SVC
+from sklearn.dummy import DummyClassifier
+
+CLASSIFIER_CONFIGS = {
+    'xgb_classifier': {
+        'model_object': XGBClassifier(random_state=SEED, use_label_encoder=False, eval_metric='logloss', verbosity=0),
+        'grid_params': {
+            'n_estimators': [100, 200],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'scale_pos_weight': [1, 3, 5]  # Kompensasi ketidakseimbangan label (1 lebih jarang dari 0)
+        }
+    },
+    'lgbm_classifier': {
+        'model_object': LGBMClassifier(random_state=SEED, verbose=-1),
+        'grid_params': {
+            'n_estimators': [100, 200],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'scale_pos_weight': [1, 3, 5]
+        }
+    },
+    'rf_classifier': {
+        'model_object': RandomForestClassifier(random_state=SEED, n_jobs=-1),
+        'grid_params': {
+            'n_estimators': [100, 200],
+            'max_depth': [5, 10, None],
+            'class_weight': ['balanced', None]
+        }
+    },
+    'svc': {
+        'model_object': SVC(random_state=SEED, probability=True),
+        'grid_params': {
+            'C': [0.1, 1, 10],
+            'kernel': ['rbf'],
+            'gamma': ['scale', 'auto'],
+            'class_weight': ['balanced', None]
+        }
+    }
 }

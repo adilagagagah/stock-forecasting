@@ -170,7 +170,7 @@ def comparison_chart(first_data_list=[], second_data_list=[],
     plt.suptitle(suptitle, fontsize=16, fontweight='bold', y=1.06)
     plt.show()
 
-def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date: str = None, end_date: str = None, predictions_df: pd.DataFrame = None, equity_curve_df: pd.DataFrame = None, trades_df: pd.DataFrame = None, show_raw_buy_signals: bool = False):
+def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date: str = None, end_date: str = None, predictions_df: pd.DataFrame = None, equity_curve_df: pd.DataFrame = None, trades_df: pd.DataFrame = None, show_raw_buy_signals: bool = False, classifier_predictions_df: pd.DataFrame = None):
     """
     Membuat grafik candlestick interaktif menggunakan Plotly.
     Sangat cocok digunakan di dalam Jupyter Notebook untuk zoom dan pan.
@@ -314,6 +314,26 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
                 name='Days to Min', hovertemplate='%{y:.0f} Hari'
             ), row=1, col=1, secondary_y=True)
 
+    # Tambahkan Sinyal Raw Classifier (Biru) jika classifier_predictions_df tersedia
+    if classifier_predictions_df is not None and not classifier_predictions_df.empty:
+        clf_df = classifier_predictions_df.reindex(df.index)
+        if 'classifier_signal' in clf_df.columns:
+            raw_signals = clf_df[clf_df['classifier_signal'] == True]
+            if not raw_signals.empty:
+                signal_prices = df.loc[raw_signals.index, 'Low'] * 0.96
+                
+                hover_data = []
+                for idx in raw_signals.index:
+                    proba = raw_signals.loc[idx, 'classifier_proba'] if 'classifier_proba' in raw_signals.columns else 0
+                    hover_data.append(f"<b>Classifier Signal (Buy the Dip)</b><br>Probabilitas: {proba:.2%}")
+                
+                fig.add_trace(go.Scatter(
+                    x=raw_signals.index, y=signal_prices, mode='markers',
+                    marker=dict(symbol='triangle-up', size=12, color='dodgerblue', line=dict(width=1, color='darkblue')),
+                    name='Classifier Raw Signal (Biru)', text=hover_data,
+                    hovertemplate='%{text}<extra></extra>'
+                ), row=1, col=1, secondary_y=False)
+
     # Tambahkan Sinyal Beli dan Jual dari trades_df
     if trades_df is not None and not trades_df.empty:
         t_df = trades_df.copy()
@@ -348,8 +368,8 @@ def plot_interactive_candlestick(df: pd.DataFrame, ticker_name: str, start_date:
                 x=t_df_buy['entry_date'],
                 y=buy_y,
                 mode='markers',
-                marker=dict(symbol='triangle-up', color='blue', size=12, line=dict(width=1, color='DarkSlateGrey')),
-                name='Sinyal Beli',
+                marker=dict(symbol='triangle-up', color='limegreen', size=12, line=dict(width=1, color='darkgreen')),
+                name='Sinyal Beli (Hijau)',
                 text=buy_hover,
                 hovertemplate='%{text}<extra></extra>'
             ), row=1, col=1, secondary_y=False)
