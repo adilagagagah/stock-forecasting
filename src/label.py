@@ -89,16 +89,16 @@ def buy_the_dip_label(df: pd.DataFrame, window: int = 5, min_return: float = 0.0
     future_return = (future_high_max - open_t) / open_t
     future_risk = (future_low_min - open_t) / open_t
     
-    df['is_buy_dip'] = ((future_return >= min_return) & (future_risk >= max_drawdown)).astype(int)
+    df['is_dip'] = ((future_return >= min_return) & (future_risk >= max_drawdown)).astype(int)
     
     return df
 
 
-def create_labels(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+def create_labels(df: pd.DataFrame, window: int = 5, min_ret: float = 0.15, max_dd: float = -0.05) -> pd.DataFrame:
     """ Menggabungkan seluruh fungsi labeling masa depan pada baris indeks T+0 """
     df = direction_label(df, window)
     df = return_label(df, window)
     df = risk_label(df, window)
     df = additional_information(df, window)
-    df = buy_the_dip_label(df, window, min_return=0.15, max_drawdown=-0.05)
+    df = buy_the_dip_label(df, window, min_return=min_ret, max_drawdown=max_dd)
     return df

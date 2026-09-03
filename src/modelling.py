@@ -1,415 +1,115 @@
 import pandas as pd
 import numpy as np
 import joblib
-import os
 import datetime
 from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, r2_score
-from scikeras.wrappers import KerasRegressor
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import (
+    mean_absolute_error, r2_score,
+    precision_score, recall_score, f1_score
+)
 
-class StandardScaler3D(BaseEstimator, TransformerMixin):
-    def __init__(self):
-        self.scaler = StandardScaler()
-        
-    def fit(self, X, y=None):
-        if X.ndim == 3:
-            n, t, f = X.shape
-            self.scaler.fit(X.reshape(-1, f))
-        else:
-            self.scaler.fit(X)
-        return self
-        
-    def transform(self, X):
-        if X.ndim == 3:
-            n, t, f = X.shape
-            return self.scaler.transform(X.reshape(-1, f)).reshape(n, t, f)
-        return self.scaler.transform(X)
+# Target klasifikasi — selain ini dianggap regresi
+CLASSIFICATION_TARGETS = ['is_dip']
 
-class TargetModellingPipeline:
-    def __init__(self, target_name: str, feature_cols: list, n_splits=5):
-        """
-        Pipeline untuk melatih, mengoptimasi (GridSearch), dan mengevaluasi 
-        satu variabel target spesifik secara terisolasi.
-        """
+
+# ------------------------------------------------------------------
+# MODELLING PIPELINE
+# ------------------------------------------------------------------
+class ModellingPipeline:
+    """
+    Pipeline terpadu untuk melatih, mengoptimasi (GridSearch), dan mengevaluasi
+    satu variabel target secara terisolasi. Mendukung regresi dan klasifikasi
+    secara otomatis berdasarkan nama target.
+    """
+
+    def __init__(self, target_name: str, feature_cols: list, n_splits: int = 5):
         self.target_name = target_name
         self.feature_cols = feature_cols
         self.n_splits = n_splits
-        
+        self.is_classifier = target_name in CLASSIFICATION_TARGETS
+
         self.best_pipeline = None
         self.model_name = None
         self.best_params = None
         self.metrics = {}
 
+    # DATA PREPARATION
     def prepare_data(self, df: pd.DataFrame):
-        """ Membersihkan NaN khusus untuk kombinasi fitur dan target ini saja """
+        """Membersihkan NaN khusus untuk kombinasi fitur dan target ini saja."""
         df_clean = df.dropna(subset=self.feature_cols + [self.target_name]).copy()
         X = df_clean[self.feature_cols].values
         y = df_clean[self.target_name].values
+
+        if self.is_classifier:
+            y = y.astype(int)
+
         return X, y
 
-    def tune_and_fit(self, X, y, model_instance, param_grid: dict):
-        """ Runs GridSearch menggunakan TimeSeriesSplit untuk menghindari data leakage """
-        is_keras_3d = getattr(model_instance, 'model', None) is not None and model_instance.__class__.__name__ == 'KerasRegressor'
-        
-        if is_keras_3d:
-            # Ubah data 2D menjadi 3D secara sliding window (mundur 10 hari)
-            timesteps = 10
-            X_new, y_new = [], []
-            for i in range(len(X) - timesteps + 1):
-                X_new.append(X[i:i+timesteps])
-                y_new.append(y[i+timesteps-1])
-            X_model = np.array(X_new)
-            y_model = np.array(y_new)
-            
-            pipeline = Pipeline([
-                ('scaler', StandardScaler3D()),
-                ('model', model_instance)
-            ])
-        else:
-            X_model = X
-            y_model = y
-            pipeline = Pipeline([
-                ('scaler', StandardScaler()),
-                ('model', model_instance)
-            ])
-            
-        # Sesuaikan key param_grid agar cocok dengan penamaan di dalam Pipeline ('model__')
-        adjusted_grid = {f"model__{k}": v for k, v in param_grid.items()}
-        
-        tscv = TimeSeriesSplit(n_splits=self.n_splits)
-        
-        grid_search = GridSearchCV(
-            estimator=pipeline,
-            param_grid=adjusted_grid,
-            cv=tscv,
-            scoring='neg_mean_absolute_error',
-            n_jobs=-1,
-            verbose=0
-        )
-        
-        # Penanganan khusus: TabNet mewajibkan target (y) berbentuk 2D
-        if model_instance.__class__.__name__ == 'TabNetRegressor':
-            y_model = y_model.reshape(-1, 1)
-
-        grid_search.fit(X_model, y_model)
-        
-        # Simpan objek pipeline terbaik hasil tuning
-        self.best_pipeline = grid_search.best_estimator_
-        self.model_name = model_instance.__class__.__name__
-        
-        # Bersihkan prefix 'model__' dari nama hyperparameter agar rapi saat dibaca & disimpan
-        self.best_params = {k.replace('model__', ''): v for k, v in grid_search.best_params_.items()}
-
-        # Val_MAE: Rata-rata error pada Out-of-Fold (Validation)
-        val_mae = -grid_search.best_score_
-        
-        # Train_MAE & Train_R2: Error murni pada data yang dilihatnya (In-Sample)
-        pure_train_preds = self.best_pipeline.predict(X_model)
-        
-        # Ratakan dimensi y dan preds ke 1D untuk memastikan kalkulasi metrik aman (terutama untuk TabNet)
-        y_eval = y_model.ravel()
-        preds_eval = pure_train_preds.ravel()
-        
-        train_mae = mean_absolute_error(y_eval, preds_eval)
-        train_r2 = r2_score(y_eval, preds_eval)
-
-        # DIRECTIONAL ACCURACY (Hit Rate) - Sangat Krusial untuk Trading!
-        # Menghitung seberapa sering model benar menebak arah (Naik/Turun)
-        if self.target_name == 'trend_slope':
-            valid_idx = y_eval != 0
-            if valid_idx.sum() > 0:
-                correct = np.sign(y_eval[valid_idx]) == np.sign(preds_eval[valid_idx])
-                hit_rate = np.mean(correct) * 100
-            else:
-                hit_rate = 0.0
-        elif 'days_to_' in self.target_name:
-            pred_rounded = np.clip(np.round(preds_eval), 1, 5)
-            correct = np.abs(y_eval - pred_rounded) <= 1
-            hit_rate = np.mean(correct) * 100
-        elif self.target_name == 'return':
-            # BAGUS: Kenyataan (y) LEBIH TINGGI atau SAMA DENGAN Prediksi (dikurangi toleransi meleset 1%)
-            # Cth: Pred 2%, Aktual 5% -> 5% >= (2% - 1%) -> TRUE (Take Profit Tersentuh)
-            # Cth: Pred 5%, Aktual 1% -> 1% >= (5% - 1%) -> FALSE (Gagal)
-            valid_preds = preds_eval > 0 # Hanya hitung jika model menyuruh beli (prediksi positif)
-            if valid_preds.sum() > 0:
-                correct = y_eval[valid_preds] >= (preds_eval[valid_preds] - 0.01)
-                hit_rate = np.mean(correct) * 100
-            else:
-                hit_rate = 0.0     
-        elif self.target_name == 'risk':
-            # BAGUS: Kenyataan (y) TIDAK LEBIH DALAM dari Prediksi (ditambah toleransi 1%)
-            # Cth: Pred -5%, Aktual -3% -> -3% >= (-5% - 1%) -> TRUE (Stop Loss Aman)
-            # Cth: Pred -5%, Aktual -10% -> -10% >= (-5% - 1%) -> FALSE (Stop Loss Jebol)
-            valid_preds = preds_eval < 0 # Hanya hitung prediksi penurunan
-            if valid_preds.sum() > 0:
-                correct = y_eval[valid_preds] >= (preds_eval[valid_preds] - 0.01)
-                hit_rate = np.mean(correct) * 100
-            else:
-                hit_rate = 0.0
-        else:
-            hit_rate = 0.0
-        
-        # Tampilkan informasi model terbaik ke konsol secara eksplisit
-        print(f"   -> [HYPERPARAMETERS]: {self.best_params}")
-        print(f"   -> [MODEL METRICS]: val MAE {val_mae:.4f} | Hit Rate {hit_rate:.2f}%")
-        
-        self.metrics = {
-            'Train_MAE': train_mae,
-            'Val_MAE': val_mae,
-            'Train_R2': train_r2,
-            'Hit_Rate_%': hit_rate
-        }
-        return self.best_pipeline
-
-    def save(self, folder_path: str, ticker: str = None):
-        """ Simpan model beserta metadata lengkap ke dalam satu file .pkl """
-        if self.best_pipeline is None:
-            raise ValueError("Model belum dilatih.")
-
-        base_folder = Path(folder_path)
-        
-        if ticker:
-            target_folder = base_folder / ticker
-            filepath = target_folder / f"model_{self.target_name}_{ticker}.pkl"
-        else:
-            target_folder = base_folder
-            filepath = target_folder / f"model_{self.target_name}.pkl"
-        
-        # SOLUSI FileNotFoundError: Otomatis buat folder jika belum ada
-        target_folder.mkdir(parents=True, exist_ok=True)
-        
-        # Menyusun struktur metadata ke dalam dictionary payload
-        metadata_payload = {
-            'pipeline': self.best_pipeline,                     # Objek model + scaler asli
-            'metadata': {
-                'model_name': self.model_name,
-                'target_name': self.target_name,
-                'best_params': self.best_params,
-                'in_sample_metrics': self.metrics,
-                'features_used': self.feature_cols,
-                'trained_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-        }
-        if ticker:
-            metadata_payload['metadata']['ticker'] = ticker
-        
-        # Ekspor berkas paket lengkap
-        joblib.dump(metadata_payload, filepath)
-        print(f"[SAVED] Berhasil mengekspor paket model + metadata ke: {filepath.as_posix()}")
-
-
-class ModelEvaluator:
-    """
-    Class untuk mengevaluasi dan membandingkan performa model machine learning 
-    terhadap baseline berdasarkan karakteristik variabel target.
-    """
-    def __init__(self, target_name, baseline_name="DummyBaseline"):
-        self.target_name = target_name
-        self.baseline_name = baseline_name
-
-    def _sort_challengers(self, df_results):
-        """Mengurutkan seluruh model penantang dari yang terbaik hingga terburuk"""
-        challenger_data = df_results[df_results['Model'] != self.baseline_name]
-
-        if self.target_name in ['return', 'trend_slope']:
-            # Prioritas: Hit Rate tertinggi -> Val MAE terendah
-            return challenger_data.sort_values(
-                by=['Hit_Rate_%', 'Val_MAE'], 
-                ascending=[False, True]
-            )
-        else: # risk, days_to_max, days_to_min
-            # Prioritas: Val MAE terendah -> Hit Rate tertinggi
-            return challenger_data.sort_values(
-                by=['Val_MAE', 'Hit_Rate_%'], 
-                ascending=[True, False]
-            )
-
-    def _check_fit_status(self, train_mae, val_mae, train_r2):
-        """Logika Overfit Detector"""
-        if train_mae == 0:
-            return "Overfit Parah"
-        if train_r2 > 0.95: 
-            return "Overfit Parah (Menghafal Data, R2>95%)"
-        
-        mae_degradation = (val_mae - train_mae) / train_mae
-        if train_r2 > 0.80 and mae_degradation > 0.15:
-            # R2 tinggi tapi error membesar di validasi
-            return "Overfitting (R2 Tinggi & Error Melebar)"
-        elif mae_degradation > 0.25:
-            return "Overfitting"
-        elif mae_degradation < -0.10: 
-            return "Aneh (Val lebih baik)"
-        else:
-            return "Good Fit"
-    
-    def _select_optimal_challenger(self, sorted_challengers):
-        """
-        Mencari model terbaik yang berstatus Good Fit. 
-        Jika semua model overfit, otomatis menggunakan model peringkat pertama (fallback).
-        """
-        if sorted_challengers.empty:
-            raise ValueError("Tidak ada model penantang yang tersedia untuk dievaluasi.")
-
-        skipped_models = []
-        for index, row in sorted_challengers.iterrows():
-            c_train_mae = row['Train_MAE']
-            c_val_mae = row['Val_MAE']
-            c_train_r2 = row['Train_R2']
-            
-            status = self._check_fit_status(c_train_mae, c_val_mae, c_train_r2)
-            
-            # Jika menemukan yang Good Fit, langsung kembalikan baris tersebut dan hentikan pencarian
-            if status == "Good Fit":
-                reason = "Memiliki skor metrik prioritas tertinggi DAN berstatus 'Good Fit' (tidak overfitting)."
-                if skipped_models:
-                    reason += f" Sistem mendiskualifikasi ({', '.join(skipped_models)}) karena statusnya Overfit."
-                return row, reason
-            else:
-                skipped_models.append(row['Model'])
-                
-        # Fallback: Jika loop selesai dan tidak ada yang 'Good Fit', ambil peringkat 1
-        best_fallback_data = sorted_challengers.iloc[0]
-        return best_fallback_data, "Semua model berstatus Overfit. Memaksa memilih model peringkat ke-1 sebagai fallback (Harap waspada)."
-
-    def _make_decision(self, c_hit_rate, bl_hit_rate, c_val_mae, bl_val_mae, fit_status):
-        """Menentukan apakah model lolos mengalahkan baseline"""
-        if self.target_name in ['return', 'trend_slope']:
-            if c_hit_rate > bl_hit_rate:
-                 return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
-            else:
-                 return "Gagal (Kalah Hit Rate dr Baseline)"
-        else:
-            if c_val_mae < bl_val_mae:
-                 return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
-            else:
-                 return "Gagal (Kalah MAE dr Baseline)"
-
-    def generate_evaluation_report(self, df_results):
-        """Method utama untuk mengeksekusi seluruh logika evaluasi dan mengembalikan dictionary laporan"""
-        baseline_data = df_results[df_results['Model'] == self.baseline_name].iloc[0]
-        sorted_challengers = self._sort_challengers(df_results)
-        best_challenger_data, selection_reason = self._select_optimal_challenger(sorted_challengers)
-
-        c_train_mae = best_challenger_data['Train_MAE']
-        c_val_mae = best_challenger_data['Val_MAE']
-        c_hit_rate = best_challenger_data['Hit_Rate_%']
-        c_train_r2 = best_challenger_data['Train_R2']
-        
-        bl_train_mae = baseline_data['Train_MAE']
-        bl_val_mae = baseline_data['Val_MAE']
-        bl_hit_rate = baseline_data['Hit_Rate_%']
-        bl_train_r2 = baseline_data['Train_R2']
-
-        challenger_fit_status = self._check_fit_status(c_train_mae, c_val_mae, c_train_r2)
-        baseline_fit_status = self._check_fit_status(bl_train_mae, bl_val_mae, bl_train_r2)
-        decision = self._make_decision(c_hit_rate, bl_hit_rate, c_val_mae, bl_val_mae, challenger_fit_status)
-
-        # Logika penentuan akhir 'Model Terpilih'
-        if "Lolos" in decision:
-            final_model = best_challenger_data['Model']
-            best_hit_rate = c_hit_rate
-            final_fit_status = challenger_fit_status
-            final_reason = selection_reason
-        else:
-            final_model = baseline_data['Model']
-            best_hit_rate = bl_hit_rate
-            final_fit_status = baseline_fit_status
-            final_reason = "Model penantang gagal mengalahkan Baseline (Kalah metrik dasar)."
-
-        metric_priority = "Hit Rate terbesar -> Val MAE terkecil" if self.target_name in ['return', 'trend_slope'] else "Val MAE terkecil -> Hit Rate terbesar"
-
-        return {
-            'Target': self.target_name,
-            'Baseline Train MAE': round(bl_train_mae, 5),
-            'Baseline Val MAE': round(bl_val_mae, 5),
-            'Baseline Hit Rate (%)': f"{bl_hit_rate:.2f}%",
-            'Challenger Train MAE': round(c_train_mae, 5),
-            'Challenger Val MAE': round(c_val_mae, 5),
-            'Challenger Hit Rate (%)': f"{c_hit_rate:.2f}%",
-            'Keputusan': decision,
-            'Model Terpilih': final_model,
-            'Best Hit Rate': f"{round(best_hit_rate, 2)}%",
-            'Fit Status': final_fit_status,
-            'Prioritas Seleksi': metric_priority,
-            'Alasan Pemilihan': final_reason
-        }
-
-
-# ==============================================================================
-# PIPELINE KLASIFIKASI BINER (Buy the Dip Detector)
-# ==============================================================================
-from sklearn.metrics import precision_score, recall_score, f1_score
-
-class ClassificationPipeline:
-    """
-    Pipeline untuk melatih, mengoptimasi (GridSearch), dan mengevaluasi
-    model klasifikasi biner (Buy the Dip Detector).
-    """
-    def __init__(self, target_name: str = 'is_buy_dip', feature_cols: list = None, n_splits=5):
-        self.target_name = target_name
-        self.feature_cols = feature_cols or []
-        self.n_splits = n_splits
-        
-        self.best_pipeline = None
-        self.model_name = None
-        self.best_params = None
-        self.metrics = {}
-
-    def prepare_data(self, df: pd.DataFrame):
-        """ Membersihkan NaN dan menyiapkan X (fitur) dan y (label biner) """
-        df_clean = df.dropna(subset=self.feature_cols + [self.target_name]).copy()
-        X = df_clean[self.feature_cols].values
-        y = df_clean[self.target_name].values.astype(int)
-        return X, y
-
+    # TRAINING + GRID SEARCH
     def tune_and_fit(self, X, y, model_instance, param_grid: dict):
         """
-        Runs GridSearch menggunakan TimeSeriesSplit.
-        Scoring: F1-Score (keseimbangan antara Precision dan Recall)
+        Menjalankan GridSearchCV dengan TimeSeriesSplit.
+        Otomatis memilih scoring dan metrik berdasarkan tipe target.
         """
         pipeline = Pipeline([
             ('scaler', StandardScaler()),
             ('model', model_instance)
         ])
-        
+
+        # Sesuaikan key param_grid agar cocok dengan penamaan Pipeline ('model__')
         adjusted_grid = {f"model__{k}": v for k, v in param_grid.items()}
-        
         tscv = TimeSeriesSplit(n_splits=self.n_splits)
-        
+
+        scoring = 'f1' if self.is_classifier else 'neg_mean_absolute_error'
+
         grid_search = GridSearchCV(
-            pipeline, adjusted_grid, cv=tscv,
-            scoring='f1',
-            n_jobs=-1, verbose=0
+            estimator=pipeline,
+            param_grid=adjusted_grid,
+            cv=tscv,
+            scoring=scoring,
+            n_jobs=-1,
+            verbose=0
         )
-        
+
         grid_search.fit(X, y)
-        
+
+        # Simpan objek pipeline terbaik hasil tuning
         self.best_pipeline = grid_search.best_estimator_
         self.model_name = model_instance.__class__.__name__
-        self.best_params = {k.replace('model__', ''): v for k, v in grid_search.best_params_.items()}
-        
-        # Metrik Validasi (Out-of-Fold)
-        val_f1 = grid_search.best_score_
-        
-        # Metrik Training (In-Sample)
+        self.best_params = {
+            k.replace('model__', ''): v
+            for k, v in grid_search.best_params_.items()
+        }
+
+        # Tampilkan hyperparameter terbaik
+        print(f"   -> [HYPERPARAMETERS]: {self.best_params}")
+
+        if self.is_classifier:
+            self._compute_classification_metrics(X, y, grid_search.best_score_)
+        else:
+            self._compute_regression_metrics(X, y, grid_search.best_score_)
+
+        return self.best_pipeline
+
+    # METRIK: KLASIFIKASI
+    def _compute_classification_metrics(self, X, y, val_f1):
+        """Menghitung metrik khusus klasifikasi (Precision, Recall, F1)."""
         train_preds = self.best_pipeline.predict(X)
         train_precision = precision_score(y, train_preds, zero_division=0)
         train_recall = recall_score(y, train_preds, zero_division=0)
         train_f1 = f1_score(y, train_preds, zero_division=0)
-        
+
         # Distribusi label
         n_positive = int(y.sum())
         n_total = len(y)
-        
-        print(f"   -> [HYPERPARAMETERS]: {self.best_params}")
+
         print(f"   -> [LABEL DIST]: {n_positive}/{n_total} positif ({n_positive/n_total*100:.1f}%)")
         print(f"   -> [TRAIN]: Precision {train_precision:.2%} | Recall {train_recall:.2%} | F1 {train_f1:.2%}")
         print(f"   -> [VAL F1]: {val_f1:.2%}")
-        
+
         self.metrics = {
             'Train_Precision': round(train_precision * 100, 2),
             'Train_Recall': round(train_recall * 100, 2),
@@ -417,25 +117,78 @@ class ClassificationPipeline:
             'Val_F1': round(val_f1 * 100, 2),
             'Label_Positive_Pct': round(n_positive / n_total * 100, 2)
         }
-        
-        return self.best_pipeline
 
+    # METRIK: REGRESI
+    def _compute_regression_metrics(self, X, y, best_score):
+        """Menghitung metrik khusus regresi (MAE, R2, Hit Rate)."""
+        val_mae = -best_score
+
+        # In-sample prediction
+        pure_train_preds = self.best_pipeline.predict(X)
+
+        y_eval = y.ravel()
+        preds_eval = pure_train_preds.ravel()
+
+        train_mae = mean_absolute_error(y_eval, preds_eval)
+        train_r2 = r2_score(y_eval, preds_eval)
+
+        # DIRECTIONAL ACCURACY (Hit Rate) — krusial untuk Trading
+        hit_rate = self._calculate_hit_rate(y_eval, preds_eval)
+
+        print(f"   -> [TRAIN]: train MAE {train_mae:.4f} | Hit Rate {hit_rate:.2f}%")
+        print(f"   -> [EVAL]: val MAE {val_mae:.4f}")
+
+        self.metrics = {
+            'Train_MAE': train_mae,
+            'Val_MAE': val_mae,
+            'Train_R2': train_r2,
+            'Hit_Rate_%': hit_rate
+        }
+
+    def _calculate_hit_rate(self, y_eval, preds_eval):
+        """Menghitung hit rate berdasarkan karakteristik target regresi."""
+        if self.target_name == 'trend_slope':
+            valid_idx = y_eval != 0
+            if valid_idx.sum() > 0:
+                correct = np.sign(y_eval[valid_idx]) == np.sign(preds_eval[valid_idx])
+                return np.mean(correct) * 100
+            return 0.0
+
+        elif self.target_name == 'return':
+            # BAGUS: Kenyataan (y) LEBIH TINGGI atau SAMA DENGAN Prediksi (dikurangi toleransi 1%)
+            valid_preds = preds_eval > 0
+            if valid_preds.sum() > 0:
+                correct = y_eval[valid_preds] >= (preds_eval[valid_preds] - 0.01)
+                return np.mean(correct) * 100
+            return 0.0
+
+        elif self.target_name == 'risk':
+            # BAGUS: Kenyataan (y) TIDAK LEBIH DALAM dari Prediksi (ditambah toleransi 1%)
+            valid_preds = preds_eval < 0
+            if valid_preds.sum() > 0:
+                correct = y_eval[valid_preds] >= (preds_eval[valid_preds] - 0.01)
+                return np.mean(correct) * 100
+            return 0.0
+
+        return 0.0
+
+    # SAVE MODEL
     def save(self, folder_path: str, ticker: str = None):
-        """ Simpan model classifier beserta metadata lengkap ke dalam satu file .pkl """
+        """Simpan model beserta metadata lengkap ke dalam satu file .pkl"""
         if self.best_pipeline is None:
             raise ValueError("Model belum dilatih.")
 
         base_folder = Path(folder_path)
-        
+
         if ticker:
             target_folder = base_folder / ticker
             filepath = target_folder / f"model_{self.target_name}_{ticker}.pkl"
         else:
             target_folder = base_folder
             filepath = target_folder / f"model_{self.target_name}.pkl"
-        
+
         target_folder.mkdir(parents=True, exist_ok=True)
-        
+
         metadata_payload = {
             'pipeline': self.best_pipeline,
             'metadata': {
@@ -444,98 +197,234 @@ class ClassificationPipeline:
                 'best_params': self.best_params,
                 'in_sample_metrics': self.metrics,
                 'features_used': self.feature_cols,
-                'model_type': 'classifier',
+                'model_type': 'classifier' if self.is_classifier else 'regressor',
                 'trained_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
         }
         if ticker:
             metadata_payload['metadata']['ticker'] = ticker
-        
+
         joblib.dump(metadata_payload, filepath)
-        print(f"[SAVED] Berhasil mengekspor model classifier ke: {filepath.as_posix()}")
+        model_type_label = "classifier" if self.is_classifier else "regressor"
+        print(f"[SAVED] Berhasil mengekspor model {model_type_label} ke: {filepath.as_posix()}")
 
 
-class ClassificationEvaluator:
+# ------------------------------------------------------------------
+# MODEL EVALUATOR
+# ------------------------------------------------------------------
+class ModelEvaluator:
     """
-    Evaluator untuk membandingkan model klasifikasi.
-    Mengurutkan model berdasarkan Val_F1, memilih yang Good Fit.
+    Evaluator terpadu untuk membandingkan performa model machine learning
+    terhadap baseline. Mendukung regresi dan klasifikasi secara otomatis.
     """
-    def __init__(self, baseline_name="DummyBaseline"):
+
+    def __init__(self, target_name: str, baseline_name: str = "DummyBaseline"):
+        self.target_name = target_name
         self.baseline_name = baseline_name
+        self.is_classifier = target_name in CLASSIFICATION_TARGETS
 
+    # SORTING CHALLENGERS
     def _sort_challengers(self, df_results):
-        """ Urutkan model penantang: Val_F1 tertinggi → Train_Precision tertinggi """
+        """Mengurutkan seluruh model penantang dari yang terbaik hingga terburuk."""
         challenger_data = df_results[df_results['Model'] != self.baseline_name]
-        return challenger_data.sort_values(
-            by=['Val_F1', 'Train_Precision'], 
-            ascending=[False, False]
-        )
 
-    def _check_fit_status(self, train_f1, val_f1):
-        """ Overfit Detector khusus Classifier """
+        # Klasifikasi: Val_F1 tertinggi → Train_Precision tertinggi
+        if self.is_classifier:
+            return challenger_data.sort_values(
+                by=['Val_F1', 'Train_Precision'],
+                ascending=[False, False]
+            )
+
+        # Regresi: Hit rate tinggi → Val_MAE rendah
+        if self.target_name in ['return', 'trend_slope']:
+            return challenger_data.sort_values(
+                by=['Hit_Rate_%', 'Val_MAE'],
+                ascending=[False, True]
+            )
+        # risk : Val_MAE rendah → Hit rate tinggi
+        else:
+            return challenger_data.sort_values(
+                by=['Val_MAE', 'Hit_Rate_%'],
+                ascending=[True, False]
+            )
+
+    # OVERFIT DETECTOR
+    def _check_fit_status(self, row):
+        """Mendeteksi status overfitting berdasarkan tipe task."""
+        if self.is_classifier:
+            return self._check_fit_classifier(row)
+        else:
+            return self._check_fit_regressor(row)
+
+    def _check_fit_classifier(self, row):
+        """Overfit Detector khusus Classifier."""
+        train_f1 = row['Train_F1']
+        val_f1 = row['Val_F1']
+
         if train_f1 == 0 and val_f1 == 0:
             return "Tidak Belajar (F1=0)"
         if train_f1 > 0 and val_f1 == 0:
             return "Overfit Parah (Val F1=0)"
-        
+
         f1_degradation = (train_f1 - val_f1) / (train_f1 + 1e-9)
         if f1_degradation > 0.40:
             return "Overfitting (F1 Drop >40%)"
         elif f1_degradation > 0.25:
             return "Overfitting"
-        else:
-            return "Good Fit"
+        return "Good Fit"
 
+    def _check_fit_regressor(self, row):
+        """Overfit Detector khusus Regressor."""
+        train_mae = row['Train_MAE']
+        val_mae = row['Val_MAE']
+        train_r2 = row['Train_R2']
+
+        if train_mae == 0:
+            return "Overfit Parah"
+        if train_r2 > 0.95:
+            return "Overfit Parah (Menghafal Data, R2>95%)"
+
+        mae_degradation = (val_mae - train_mae) / train_mae
+        if train_r2 > 0.80 and mae_degradation > 0.15:
+            return "Overfitting (R2 Tinggi & Error Melebar)"
+        elif mae_degradation > 0.25:
+            return "Overfitting"
+        elif mae_degradation < -0.10:
+            return "Aneh (Val lebih baik)"
+        return "Good Fit"
+
+    # OPTIMAL CHALLENGER SELECTION
     def _select_optimal_challenger(self, sorted_challengers):
-        """ Memilih model terbaik yang berstatus Good Fit """
+        """
+        Mencari model terbaik yang berstatus Good Fit.
+        Jika semua model overfit, otomatis menggunakan model peringkat pertama (fallback).
+        """
         if sorted_challengers.empty:
-            raise ValueError("Tidak ada model penantang yang tersedia.")
+            raise ValueError("Tidak ada model penantang yang tersedia untuk dievaluasi.")
 
         skipped_models = []
         for _, row in sorted_challengers.iterrows():
-            status = self._check_fit_status(row['Train_F1'], row['Val_F1'])
-            
+            status = self._check_fit_status(row)
+
             if status == "Good Fit":
-                reason = f"Val F1 tertinggi ({row['Val_F1']:.2f}%) DAN berstatus 'Good Fit'."
-                if skipped_models:
-                    reason += f" Sistem mendiskualifikasi ({', '.join(skipped_models)}) karena statusnya Overfit."
+                reason = self._build_selection_reason(row, skipped_models)
                 return row, reason
             else:
                 skipped_models.append(row['Model'])
-                
-        best_fallback = sorted_challengers.iloc[0]
-        return best_fallback, "Semua model Overfit. Memilih peringkat ke-1 sebagai fallback."
 
+        # Fallback: semua overfit
+        best_fallback = sorted_challengers.iloc[0]
+        return best_fallback, "Semua model berstatus Overfit. Memaksa memilih model peringkat ke-1 sebagai fallback (Harap waspada)."
+
+    def _build_selection_reason(self, row, skipped_models):
+        """Membangun string alasan pemilihan model."""
+        if self.is_classifier:
+            reason = f"Val F1 tertinggi ({row['Val_F1']:.2f}%) DAN berstatus 'Good Fit'."
+        else:
+            reason = "Memiliki skor metrik prioritas tertinggi DAN berstatus 'Good Fit' (tidak overfitting)."
+
+        if skipped_models:
+            reason += f" Sistem mendiskualifikasi ({', '.join(skipped_models)}) karena statusnya Overfit."
+        return reason
+
+    # DECISION LOGIC
+    def _make_decision(self, best_challenger, baseline_data, fit_status):
+        """Menentukan apakah model penantang lolos mengalahkan baseline."""
+        if self.is_classifier:
+            if best_challenger['Val_F1'] > baseline_data['Val_F1']:
+                return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
+            return "Gagal (Kalah F1 dari Baseline)"
+
+        # Regresi
+        if self.target_name in ['return', 'trend_slope']:
+            if best_challenger['Hit_Rate_%'] > baseline_data['Hit_Rate_%']:
+                return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
+            return "Gagal (Kalah Hit Rate dr Baseline)"
+        else:
+            if best_challenger['Val_MAE'] < baseline_data['Val_MAE']:
+                return "Lolos" if fit_status == "Good Fit" else "Lolos (Awas Overfit)"
+            return "Gagal (Kalah MAE dr Baseline)"
+
+    # ------------------------------------------------------------------
+    # REPORT GENERATION
+    # ------------------------------------------------------------------
     def generate_evaluation_report(self, df_results):
-        """ Menghasilkan laporan evaluasi dan memilih model terbaik """
+        """Method utama: eksekusi seluruh logika evaluasi dan kembalikan dictionary laporan."""
         baseline_data = df_results[df_results['Model'] == self.baseline_name].iloc[0]
         sorted_challengers = self._sort_challengers(df_results)
         best_challenger, selection_reason = self._select_optimal_challenger(sorted_challengers)
-        
-        challenger_fit = self._check_fit_status(best_challenger['Train_F1'], best_challenger['Val_F1'])
-        baseline_fit = self._check_fit_status(baseline_data['Train_F1'], baseline_data['Val_F1'])
-        
-        # Keputusan: Challenger lolos jika Val_F1 > Baseline Val_F1
-        if best_challenger['Val_F1'] > baseline_data['Val_F1']:
-            decision = "Lolos" if challenger_fit == "Good Fit" else "Lolos (Awas Overfit)"
-            final_model = best_challenger['Model']
-            final_fit = challenger_fit
-            final_reason = selection_reason
+
+        challenger_fit = self._check_fit_status(best_challenger)
+        baseline_fit = self._check_fit_status(baseline_data)
+        decision = self._make_decision(best_challenger, baseline_data, challenger_fit)
+
+        if self.is_classifier:
+            return self._build_classification_report(
+                best_challenger, baseline_data,
+                challenger_fit, baseline_fit,
+                decision, selection_reason
+            )
+        return self._build_regression_report(
+            best_challenger, baseline_data,
+            challenger_fit, baseline_fit,
+            decision, selection_reason
+        )
+
+    def _build_classification_report(self, challenger, baseline, c_fit, bl_fit, decision, reason):
+        """Menyusun laporan evaluasi untuk model klasifikasi."""
+        if "Lolos" in decision:
+            final_model = challenger['Model']
+            final_fit = c_fit
+            final_reason = reason
         else:
-            decision = "Gagal (Kalah F1 dari Baseline)"
-            final_model = baseline_data['Model']
-            final_fit = baseline_fit
+            final_model = baseline['Model']
+            final_fit = bl_fit
             final_reason = "Tidak ada model yang mengalahkan Baseline."
 
         return {
-            'Target': 'is_buy_dip',
-            'Baseline Val_F1': f"{baseline_data['Val_F1']:.2f}%",
-            'Challenger Model': best_challenger['Model'],
-            'Challenger Val_F1': f"{best_challenger['Val_F1']:.2f}%",
-            'Challenger Precision': f"{best_challenger['Train_Precision']:.2f}%",
-            'Challenger Recall': f"{best_challenger['Train_Recall']:.2f}%",
+            'Target': self.target_name,
+            'Baseline Val_F1': f"{baseline['Val_F1']:.2f}%",
+            'Challenger Model': challenger['Model'],
+            'Challenger Val_F1': f"{challenger['Val_F1']:.2f}%",
+            'Challenger Precision': f"{challenger['Train_Precision']:.2f}%",
+            'Challenger Recall': f"{challenger['Train_Recall']:.2f}%",
             'Keputusan': decision,
             'Model Terpilih': final_model,
             'Fit Status': final_fit,
+            'Alasan Pemilihan': final_reason
+        }
+
+    def _build_regression_report(self, challenger, baseline, c_fit, bl_fit, decision, reason):
+        """Menyusun laporan evaluasi untuk model regresi."""
+        if "Lolos" in decision:
+            final_model = challenger['Model']
+            best_hit_rate = challenger['Hit_Rate_%']
+            final_fit = c_fit
+            final_reason = reason
+        else:
+            final_model = baseline['Model']
+            best_hit_rate = baseline['Hit_Rate_%']
+            final_fit = bl_fit
+            final_reason = "Model penantang gagal mengalahkan Baseline (Kalah metrik dasar)."
+
+        metric_priority = (
+            "Hit Rate terbesar -> Val MAE terkecil"
+            if self.target_name in ['return', 'trend_slope']
+            else "Val MAE terkecil -> Hit Rate terbesar"
+        )
+
+        return {
+            'Target': self.target_name,
+            'Baseline Train MAE': round(baseline['Train_MAE'], 5),
+            'Baseline Val MAE': round(baseline['Val_MAE'], 5),
+            'Baseline Hit Rate (%)': f"{baseline['Hit_Rate_%']:.2f}%",
+            'Challenger Train MAE': round(challenger['Train_MAE'], 5),
+            'Challenger Val MAE': round(challenger['Val_MAE'], 5),
+            'Challenger Hit Rate (%)': f"{challenger['Hit_Rate_%']:.2f}%",
+            'Keputusan': decision,
+            'Model Terpilih': final_model,
+            'Best Hit Rate': f"{round(best_hit_rate, 2)}%",
+            'Fit Status': final_fit,
+            'Prioritas Seleksi': metric_priority,
             'Alasan Pemilihan': final_reason
         }

@@ -64,22 +64,44 @@ def load_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame
         # Menyediakan error message yang jelas untuk keperluan logging produksi
         raise RuntimeError(f"Gagal memuat data pasar untuk {ticker}. Error: {str(e)}")
 
-def dataset_splitting(X, y):
+def dataset_splitting(X, y, in_start, in_end, os_start, os_end):
     # Pastikan indeks data berbentuk DatetimeIndex
     X.index = pd.to_datetime(X.index)
     y.index = pd.to_datetime(y.index)
 
     # 1. Isolasi Periode In-Sample (Train & Validation Base: 2015 - 2023)
-    X_in_sample = X.loc['2015-01-01':'2023-12-31']
-    y_in_sample = y.loc['2015-01-01':'2023-12-31']
+    X_in_sample = X.loc[in_start:in_end]
+    y_in_sample = y.loc[in_start:in_end]
 
     # 2. Isolasi Periode Out-of-Sample (Test Set & Backtest Engine: 2024 - 2025)
     # Data ini tidak boleh disentuh sedikit pun selama proses tuning hyperparameter
-    X_out_sample = X.loc['2024-01-01':'2025-12-31']
-    y_out_sample = y.loc['2024-01-01':'2025-12-31']
+    X_out_sample = X.loc[os_start:os_end]
+    y_out_sample = y.loc[os_start:os_end]
 
     # 3. Live Paper Trading / Forward Test
-    X_forward = X.loc['2026-01-01':]
-    y_forward = y.loc['2026-01-01':]
+    X_forward = X.loc[os_end:]
+    y_forward = y.loc[os_end:]
 
     return X_in_sample, y_in_sample, X_out_sample, y_out_sample, X_forward, y_forward
+
+# Cek distribusi label
+def target_distribution(df_func, list_target):
+    summary_list = []
+    for target in list_target:
+        if target in df_func.columns:
+            s = df_func[target].dropna()
+            summary_list.append({
+                'Target': target,
+                'Valid': len(s),
+                'NaN': df_func[target].isna().sum(),
+                '% Positif (>0)': f"{(s > 0).sum():>5} hari ({(s > 0).sum()/len(s)*100:.1f}%)%",
+                '% Nol (==0)': f"{(s == 0).sum():>5} hari ({(s == 0).sum()/len(s)*100:.1f}%)",
+                '% Negatif (<0)': f"{(s < 0).sum():>5} hari ({(s < 0).sum()/len(s)*100:.1f}%)",
+                'Min': f"{s.min()*100:.2f}%" if target != 'trend_slope' else f"{s.min():.4f}",
+                'Median': f"{s.median()*100:.2f}%" if target != 'trend_slope' else f"{s.median():.4f}",
+                'Mean': f"{s.mean()*100:.2f}%" if target != 'trend_slope' else f"{s.mean():.4f}",
+                'Max': f"{s.max()*100:.2f}%" if target != 'trend_slope' else f"{s.max():.4f}"
+            })
+
+    df_reg_summary = pd.DataFrame(summary_list).set_index('Target')
+    display(df_reg_summary)

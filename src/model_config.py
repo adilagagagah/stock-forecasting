@@ -46,7 +46,7 @@ FEATURES = [
     'Dist_to_MA50', 'EMA50_Slope', 'ATR_Pct_Change', 'BB_Width', 'Volume_Spike'
 ]
 
-TARGET = ['return', 'risk', 'trend_slope', 'days_to_max', 'days_to_min']
+TARGET = ['is_dip', 'return', 'risk', 'trend_slope']
 
 TIMESTEPS = 10 
 FEATURES_COUNT = len(FEATURES) 
@@ -91,14 +91,14 @@ def build_transformer(head_size=32, num_heads=2, dropout_rate=0.2):
     return model
 
 
-BASELINE_CONFIG = {
+REGRESSOR_BASELINE_CONFIG = {
     'name': 'DummyBaseline',
     'model_object': DummyRegressor(strategy='mean'),
     'grid_params': {}, # Tidak butuh hyperparameter tuning
     'data_format': '2d'
 }
 
-MODEL_CONFIGS = {
+REGRESSOR_CONFIGS = {
     # 1. Linear-Regularized Model
     'ridge_regression': {
         'model_object': Ridge(random_state=42),
@@ -253,6 +253,13 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from sklearn.svm import SVC
 from sklearn.dummy import DummyClassifier
+
+CLASSIFIER_BASELINE_CONFIG = {
+    'name': 'DummyBaseline',
+    'model_object': DummyClassifier(strategy='stratified'),
+    'grid_params': {}, # Tidak butuh hyperparameter tuning
+    'data_format': '2d'
+}
 
 CLASSIFIER_CONFIGS = {
     'xgb_classifier': {
