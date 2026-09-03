@@ -18,7 +18,8 @@ class WalkForwardBacktester:
         max_holding_days: int = 5,
         fee_buy: float = 0.0015,
         fee_sell: float = 0.0025,
-        initial_capital: float = 5_000_000.0
+        initial_capital: float = 5_000_000.0,
+        ma_type: str = 'ema'
     ):
         """
         Mesin Backtest Walk-Forward Analysis (WFA) berbasis Expanding Window.
@@ -32,6 +33,7 @@ class WalkForwardBacktester:
         - max_holding_days : Maksimum hari menahan posisi (default: 5)
         - fee_buy / fee_sell : Biaya aplikasi beli & jual (default: 0.15% & 0.25%)
         - initial_capital : Modal awal simulasi (default: Rp 5.000.000)
+        - ma_type : Jenis MA untuk trailing exit saat Strong Uptrend ('ema' atau 'sma', default: 'ema')
         """
         self.ticker = ticker
         self.min_dip_proba = min_dip_proba
@@ -42,6 +44,9 @@ class WalkForwardBacktester:
         self.fee_buy = fee_buy
         self.fee_sell = fee_sell
         self.initial_capital = initial_capital
+        self.ma_type = ma_type.lower()
+        self.ma5_series = None
+        self.ma10_series = None
 
         # Struktur penampung portofolio & riwayat
         self.active_trades = []      # Daftar posisi aktif (T+0 s.d T+4)
@@ -95,7 +100,15 @@ class WalkForwardBacktester:
                 print(f"[ERROR] File model '{target}' tidak ditemukan di: {model_path}")
                 raise
 
-        # B. Penentuan Regime Trend
+        # B. Penentuan Regime Trend & Moving Average Exit
+        # Hitung MA 5 & 10 untuk trailing exit dinamis saat Strong Uptrend
+        if self.ma_type == 'sma':
+            self.ma5_series = df_raw_prices['Close'].rolling(window=5).mean()
+            self.ma10_series = df_raw_prices['Close'].rolling(window=10).mean()
+        else:
+            self.ma5_series = df_raw_prices['Close'].ewm(span=5, adjust=False).mean()
+            self.ma10_series = df_raw_prices['Close'].ewm(span=10, adjust=False).mean()
+
         # Hitung indikator EMA untuk penentuan regime tren
         ema5 = df_raw_prices['Close'].ewm(span=5, adjust=False).mean()
         ema10 = df_raw_prices['Close'].ewm(span=10, adjust=False).mean()
@@ -167,7 +180,7 @@ class WalkForwardBacktester:
 
                 # C2. Entry : EXECUTION ENGINE (OPENING): Beli di harga Open jika disetujui (Maks 1 posisi)
                 if risk_eval['execute_trade'] and len(self.active_trades) == 0:
-                    self._execute_buy_order(current_date, risk_eval, preds) # output : self.active_trades.append(trade)
+                    self._execute_buy_order(current_date, risk_eval, preds, current_regime=current_regime) # output : self.active_trades.append(trade)
 
                 # C3. Exit : END-OF-DAY EVALUATION: Cek Exit (TP, SL, Time-Stop) untuk posisi aktif
                 self._process_active_exits(current_date, df_raw_prices, regime_series=current_regime) # output : self.trade_history.append(log_entry)
@@ -225,7 +238,7 @@ class WalkForwardBacktester:
 
         return self._summarize_performance()
 
-    def _execute_buy_order(self, date, risk_eval: dict, preds: dict):
+    def _execute_buy_order(self, date, risk_eval: dict, preds: dict, current_regime: int = 2):
         """Mencatat transaksi beli baru ke portofolio aktif"""
         capital_needed = risk_eval['capital_spent_idr']
         
@@ -235,6 +248,7 @@ class WalkForwardBacktester:
 
         # Potong Kas
         self.current_capital -= capital_needed
+        is_strong_uptrend = (current_regime == 1)
         
         # Susun struktur data trade aktif
         trade = {
@@ -247,17 +261,19 @@ class WalkForwardBacktester:
             'capital_spent': capital_needed,
             'tp_price': risk_eval['suggested_take_profit'],
             'sl_price': risk_eval['suggested_stop_loss'],
-            'days_held': 0
+            'days_held': 0,
+            'is_strong_uptrend': is_strong_uptrend
         }
         
         self.active_trades.append(trade)
         total_equity = self.current_capital + capital_needed
-        print(f"  [BUY LOG]  {date.date()} | Beli                 @ Rp{trade['entry_price']:<7,.2f} | Lot: {trade['lots']:<4} | Modal : Rp{capital_needed:>10,.2f}            | Ekuitas: Rp{total_equity:>12,.2f}")
+        regime_tag = "[STRONG UPTREND]" if is_strong_uptrend else "[NORMAL]"
+        print(f"  [BUY LOG]  {date.date()} | Beli {regime_tag:<16} @ Rp{trade['entry_price']:<7,.2f} | Lot: {trade['lots']:<4} | Modal : Rp{capital_needed:>10,.2f}            | Ekuitas: Rp{total_equity:>12,.2f}")
         print(f"       |->  [REASON] Dip: {preds['return']*100:.2f}% | Slope: {preds['trend_slope']:.4f} | Ret: {preds['return']*100:.2f}% | Risk: {preds['risk']*100:.2f}% | RR: {risk_eval['actual_rr_ratio']:.2f} | Dip: {preds['is_dip']*100:.2f}%")
         print(f"       |->  [TARGET] TP: {trade['tp_price']:<7,.2f} | SL: {trade['sl_price']:<7,.2f}")
 
     def _process_active_exits(self, current_date, df_raw_prices: pd.DataFrame, force_close: bool = False, regime_series: int = 2):
-        """Mengevaluasi Hard-Exit (TP, SL, Time-Stop) pada akhir hari bursa"""
+        """Mengevaluasi Hard-Exit (TP, SL, MA Crossover, Time-Stop) pada akhir hari bursa"""
         if not self.active_trades or current_date not in df_raw_prices.index:
             return
 
@@ -266,33 +282,55 @@ class WalkForwardBacktester:
         low_price = today_price['Low']
         close_price = today_price['Close']
 
+        ma5_curr = self.ma5_series.loc[current_date] if self.ma5_series is not None and current_date in self.ma5_series.index else None
+        ma10_curr = self.ma10_series.loc[current_date] if self.ma10_series is not None and current_date in self.ma10_series.index else None
+
         for trade in self.active_trades[:]:
             is_entry_day = (trade['entry_date'] == current_date)
             
             if not force_close and not is_entry_day:
                 trade['days_held'] += 1
             
-            # Logika Pemicu Exit (Hard-Exit Rules)
-            hit_tp = high_price >= trade['tp_price']
-            
+            # Upgrade ke strong uptrend jika pasar hari ini terkonfirmasi regime 1
             if regime_series == 1:
+                trade['is_strong_uptrend'] = True
+
+            in_strong_uptrend = trade.get('is_strong_uptrend', False)
+
+            hit_tp = False
+            hit_ma_cross = False
+            hit_time_stop = False
+
+            if in_strong_uptrend:
+                # Batas TP dihilangkan untuk menangkap reli bullish besar
+                hit_tp = False
+                # Langsung exit ketika MA 5 berpotongan / menembus ke bawah MA 10
+                if not is_entry_day and ma5_curr is not None and ma10_curr is not None and ma5_curr <= ma10_curr:
+                    hit_ma_cross = True
+
+                # SL tetap melindungi modal dari crash/gap down
                 hit_sl = low_price <= trade['sl_price'] * 0.75
-                hit_time_stop = trade['days_held'] >= 10
+                # Time-stop dihilangkan agar riding bullish tidak terputus prematur
+                hit_time_stop = False
             else:
+                hit_tp = high_price >= trade['tp_price']
                 hit_sl = low_price <= trade['sl_price']
                 hit_time_stop = trade['days_held'] >= self.max_holding_days
 
-            if hit_tp or hit_sl or hit_time_stop or force_close:
+            if hit_tp or hit_sl or hit_time_stop or hit_ma_cross or force_close:
                 # Penentuan Harga Jual Realistis
                 if force_close:
                     exit_price = close_price
                     exit_reason = "Akhir Backtest"
-                elif hit_tp:
-                    exit_price = trade['tp_price']
-                    exit_reason = "Take Profit"
                 elif hit_sl:
                     exit_price = trade['sl_price']
                     exit_reason = "Stop Loss"
+                elif hit_ma_cross:
+                    exit_price = close_price
+                    exit_reason = f"{self.ma_type.upper()} 5/10 Cross"
+                elif hit_tp:
+                    exit_price = trade['tp_price']
+                    exit_reason = "Take Profit"
                 else:
                     exit_price = close_price
                     exit_reason = "Time-Stop"
@@ -331,7 +369,7 @@ class WalkForwardBacktester:
                 self.trade_history.append(log_entry)
                 self.active_trades.remove(trade)
 
-                print(f"  [SELL LOG] {current_date.date()} | Jual ({exit_reason:<12}) @ Rp{exit_price:<7,.2f} | Lot: {trade['lots']:<4} | Profit: Rp{net_profit:>10,.2f} ({roi_pct:>+6.2f}%) | Ekuitas: Rp{total_equity:>12,.2f}\n")
+                print(f"  [SELL LOG] {current_date.date()} | Jual ({exit_reason:<16}) @ Rp{exit_price:<7,.2f} | Lot: {trade['lots']:<4} | Profit: Rp{net_profit:>10,.2f} ({roi_pct:>+6.2f}%) | Ekuitas: Rp{total_equity:>12,.2f}\n")
 
     def _retrain_models(self, X_train: pd.DataFrame, y_train_dict):
         """
