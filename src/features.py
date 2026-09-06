@@ -230,12 +230,43 @@ def calculate_macro_context_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def calculate_swing_bottom_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fitur khusus untuk mendeteksi swing bottom / wave reversal di bear market.
+    Membantu model ML mengidentifikasi kondisi oversold ekstrem dan potensi bounce.
+    
+    Semua di-shift(1) agar bebas dari data leakage.
+    
+    Fitur yang ditambahkan:
+    - Dist_to_52w_Low    : Jarak harga ke titik terendah 52 minggu (~250 hari bursa)
+    - Consecutive_Down   : Jumlah hari turun berturut-turut dalam 10 hari terakhir
+    - Dist_to_Low_10d    : Jarak harga ke titik terendah 10 hari terakhir (swing proximity)
+    """
+    df = df.copy()
+    close_yesterday = df['Close'].shift(1)
+    
+    # 1. Jarak ke 52-week Low — Seberapa dekat ke bottom historis
+    low_52w = df['Low'].shift(1).rolling(window=250, min_periods=50).min()
+    df['Dist_to_52w_Low'] = ((close_yesterday - low_52w) / (low_52w + 1e-9))
+    
+    # 2. Consecutive Down Days — Berapa hari berturut-turut harga turun (dalam 10 hari)
+    is_down = (df['Close'] < df['Close'].shift(1)).astype(int)
+    df['Consecutive_Down'] = is_down.rolling(window=10).sum().shift(1)
+    
+    # 3. Jarak ke titik terendah 10 hari — Swing proximity (dekat support lokal)
+    low_10d = df['Low'].shift(1).rolling(window=10).min()
+    df['Dist_to_Low_10d'] = ((close_yesterday - low_10d) / (low_10d + 1e-9))
+    
+    return df
+
+
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_atr(df)
     df = calculate_technical_indicators(df)
     df = detect_support_resistance(df)
     df = calculate_climax_features(df)
     df = calculate_macro_context_features(df)
+    df = calculate_swing_bottom_features(df)
     return df
 
 # ------------------------------------------

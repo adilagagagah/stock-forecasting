@@ -19,7 +19,10 @@ class WalkForwardBacktester:
         fee_buy: float = 0.0015,
         fee_sell: float = 0.0025,
         initial_capital: float = 5_000_000.0,
-        ma_type: str = 'ema'
+        ma_type: str = 'ema',
+        enable_pyramiding: bool = True,
+        max_pyramid_adds: int = 2,
+        pyramid_profit_threshold: float = 0.05
     ):
         """
         Mesin Backtest Walk-Forward Analysis (WFA) berbasis Expanding Window.
@@ -34,6 +37,9 @@ class WalkForwardBacktester:
         - fee_buy / fee_sell : Biaya aplikasi beli & jual (default: 0.15% & 0.25%)
         - initial_capital : Modal awal simulasi (default: Rp 5.000.000)
         - ma_type : Jenis MA untuk trailing exit saat Strong Uptrend ('ema' atau 'sma', default: 'ema')
+        - enable_pyramiding : Mengaktifkan penambahan posisi saat tren terkonfirmasi (default: True)
+        - max_pyramid_adds : Maksimum penambahan posisi per transaksi aktif (default: 2)
+        - pyramid_profit_threshold : Keuntungan minimum sebelum boleh pyramiding (default: +5%)
         """
         self.ticker = ticker
         self.min_dip_proba = min_dip_proba
@@ -45,6 +51,9 @@ class WalkForwardBacktester:
         self.fee_sell = fee_sell
         self.initial_capital = initial_capital
         self.ma_type = ma_type.lower()
+        self.enable_pyramiding = enable_pyramiding
+        self.max_pyramid_adds = max_pyramid_adds
+        self.pyramid_profit_threshold = pyramid_profit_threshold
         self.ma5_series = None
         self.ma10_series = None
 
@@ -59,6 +68,11 @@ class WalkForwardBacktester:
         self.features_used = {}      # Menampung fitur asli yang digunakan saat pre-training
         self.daily_predictions = []  # Menampung hasil prediksi harian
         self.predictions_df = None   # DataFrame hasil prediksi
+        self.rsi_series = None       # RSI 14 untuk deteksi oversold (Bear Bounce)
+        self.macd_hist_series = None # MACD Histogram untuk konfirmasi momentum pembalikan arah
+        self.ma20_series = None      # EMA 20
+        self.ma50_series = None      # EMA 50
+        self.last_swing_exit_date = None  # Cooldown tracker: tanggal terakhir keluar dari swing trade
 
     def run_backtest(
         self, 
@@ -78,6 +92,7 @@ class WalkForwardBacktester:
         self.trade_history = []
         self.equity_curve = []
         self.daily_predictions = []
+        self.last_swing_exit_date = None
 
         print("=" * 70)
         print(f" MEMULAI SIMULASI WALK-FORWARD ANALYSIS ({self.ticker})")
@@ -112,8 +127,10 @@ class WalkForwardBacktester:
         # Hitung indikator EMA untuk penentuan regime tren
         ema5 = df_raw_prices['Close'].ewm(span=5, adjust=False).mean()
         ema10 = df_raw_prices['Close'].ewm(span=10, adjust=False).mean()
-        ema20 = df_raw_prices['Close'].ewm(span=20, adjust=False).mean()
-        ema50 = df_raw_prices['Close'].ewm(span=50, adjust=False).mean()
+        self.ma20_series = df_raw_prices['Close'].ewm(span=20, adjust=False).mean()
+        self.ma50_series = df_raw_prices['Close'].ewm(span=50, adjust=False).mean()
+        ema20 = self.ma20_series
+        ema50 = self.ma50_series
 
         # Daily trend condition based on EMA arrangement (Bullish vs Bearish alignment)
         daily_uptrend = (ema5 > ema10) & (ema10 > ema20) & (ema20 > ema50)
@@ -126,6 +143,21 @@ class WalkForwardBacktester:
         regime_series = pd.Series(2, index=df_raw_prices.index)  # Default: 2 (Sideways)
         regime_series[is_uptrend_5d] = 1   # 1: Uptrend jika 5 hari berturut-turut naik/bullish
         regime_series[is_downtrend_5d] = 3 # 3: Downtrend jika 5 hari berturut-turut turun/bearish
+
+        # Hitung MACD Histogram untuk konfirmasi momentum pembalikan arah
+        ema12 = df_raw_prices['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = df_raw_prices['Close'].ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        self.macd_hist_series = macd - macd_signal
+
+        # Hitung RSI 14 untuk deteksi oversold & divergence
+        delta = df_raw_prices['Close'].diff()
+        gain = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(span=14, adjust=False).mean()
+        rs = gain / (loss + 1e-9)
+        self.rsi_series = 100 - (100 / (1 + rs))
+
         # Geser mundur satu hari agar kondisi diketahui saat open market hari T (mencegah look-ahead bias)
         regime_series = regime_series.shift(1).fillna(2).astype(int)
 
@@ -162,6 +194,15 @@ class WalkForwardBacktester:
                 entry_price_today = df_raw_prices.loc[current_date, 'Open']
                 current_regime = regime_series.loc[current_date] if current_date in regime_series.index else 2
                 
+                # Rule-Based Swing Detector (Lapisan Kedua: Presisi Timing Entry)
+                swing_info = self._detect_rule_based_swing(current_date, df_raw_prices, current_regime)
+                
+                # Cooldown: blokir swing entry selama 5 hari kerja setelah swing trade terakhir keluar
+                if swing_info['is_swing'] and self.last_swing_exit_date is not None:
+                    days_since_swing_exit = len(df_raw_prices.loc[self.last_swing_exit_date:current_date]) - 1
+                    if days_since_swing_exit < 5:
+                        swing_info = {"is_swing": False, "sl_price": None, "tp_price": None}
+                
                 risk_eval = evaluate_trade_risk(
                     total_capital=self.current_capital,
                     entry_price=entry_price_today,
@@ -175,12 +216,71 @@ class WalkForwardBacktester:
                     max_allocation_percentage=self.max_alloc_pct,
                     fee_buy=self.fee_buy,
                     fee_sell=self.fee_sell,
-                    regime_series=current_regime
+                    regime_series=current_regime,
+                    rule_based_swing=swing_info['is_swing'],
+                    swing_sl_price=swing_info['sl_price'],
+                    swing_tp_price=swing_info['tp_price']
                 )
 
-                # C2. Entry : EXECUTION ENGINE (OPENING): Beli di harga Open jika disetujui (Maks 1 posisi)
-                if risk_eval['execute_trade'] and len(self.active_trades) == 0:
-                    self._execute_buy_order(current_date, risk_eval, preds, current_regime=current_regime) # output : self.active_trades.append(trade)
+                # C2. Entry atau Pyramiding : EXECUTION ENGINE (OPENING)
+                if risk_eval['execute_trade']:
+                    if len(self.active_trades) == 0:
+                        # Initial Entry (Maks 1 posisi aktif utama)
+                        self._execute_buy_order(current_date, risk_eval, preds, current_regime=current_regime)
+                    elif self.enable_pyramiding:
+                        # Pyramiding: Tambah posisi ke trade aktif yang sedang berjalan jika tren terkonfirmasi kuat
+                        active_trade = self.active_trades[0]
+                        avg_cost = active_trade['capital_spent'] / (active_trade['shares'] + 1e-9)
+                        unrealized_gain = (entry_price_today - avg_cost) / avg_cost
+                        pyramid_count = active_trade.get('pyramid_count', 0)
+
+                        # Syarat Pyramiding Terintegrasi:
+                        # 1. Sedang dalam kondisi Strong Uptrend (terkonfirmasi)
+                        # 2. Posisi sudah untung minimal +5% (Anti-Martingale: hanya tambah saat profit)
+                        # 3. Jumlah penambahan belum mencapai batas maksimal (pyramid_count < max_pyramid_adds)
+                        # 4. Kas tunai masih mencukupi reserve aman
+                        min_cash_reserve = min(1_000_000.0, self.initial_capital * 0.10)
+                        if (active_trade.get('is_strong_uptrend', False) and 
+                            unrealized_gain >= self.pyramid_profit_threshold and 
+                            pyramid_count < self.max_pyramid_adds and 
+                            self.current_capital > min_cash_reserve):
+                            
+                            # Alokasi pyramiding: 40% dari sisa kas (atau 25% modal awal jika kas berlebih)
+                            pyramid_alloc = min(self.current_capital * 0.40, self.initial_capital * 0.25)
+                            cost_buy = entry_price_today * (1 + self.fee_buy)
+                            add_lots = math.floor(pyramid_alloc / (100 * cost_buy))
+                            
+                            if add_lots > 0:
+                                add_capital = add_lots * 100 * cost_buy
+                                self.current_capital -= add_capital
+                                
+                                active_trade['shares'] += add_lots * 100
+                                active_trade['lots'] += add_lots
+                                active_trade['capital_spent'] += add_capital
+                                active_trade['cost_per_share'] = active_trade['capital_spent'] / active_trade['shares']
+                                active_trade['entry_price'] = active_trade['cost_per_share']  # Weighted average entry price
+                                active_trade['entry_price_inc_fee'] = active_trade['cost_per_share']
+                                active_trade['pyramid_count'] = pyramid_count + 1
+                                
+                                if 'pyramid_adds' not in active_trade:
+                                    active_trade['pyramid_adds'] = []
+                                active_trade['pyramid_adds'].append({
+                                    'date': current_date,
+                                    'price': entry_price_today,
+                                    'lots': add_lots,
+                                    'capital': add_capital,
+                                    'unrealized_gain_at_add': unrealized_gain
+                                })
+                                
+                                # Trailing Stop Loss untuk melindungi modal akumulasi
+                                active_trade['sl_price'] = max(active_trade['sl_price'], entry_price_today * 0.90)
+                                
+                                market_val = active_trade['shares'] * entry_price_today
+                                floating_pnl_rp = market_val - active_trade['capital_spent']
+                                floating_pnl_pct = (floating_pnl_rp / active_trade['capital_spent']) * 100
+                                total_equity = self.current_capital + market_val
+                                print(f"  [PYRAMID ADD #{active_trade['pyramid_count']}] {current_date.date()} | Add Value: Rp{market_val:>11,.2f} | Beli Tambah @ Rp{entry_price_today:<7,.2f} | Tambah Lot: +{add_lots:<4} | Total Lot: {active_trade['lots']:<4} | Avg Entry: Rp{active_trade['entry_price']:<7,.2f}")
+                                print(f"       |->  [STATUS]     Total Invested: Rp{active_trade['capital_spent']:>11,.2f} | P&L: Rp{floating_pnl_rp:>+11,.2f} ({floating_pnl_pct:>+6.2f}%) | Trading Balance: Rp{self.current_capital:>11,.2f} | Total Equity: Rp{total_equity:>11,.2f}")
 
                 # C3. Exit : END-OF-DAY EVALUATION: Cek Exit (TP, SL, Time-Stop) untuk posisi aktif
                 self._process_active_exits(current_date, df_raw_prices, regime_series=current_regime) # output : self.trade_history.append(log_entry)
@@ -249,6 +349,7 @@ class WalkForwardBacktester:
         # Potong Kas
         self.current_capital -= capital_needed
         is_strong_uptrend = (current_regime == 1)
+        is_bear_swing = risk_eval.get('swing_triggered', False)
         
         # Susun struktur data trade aktif
         trade = {
@@ -256,21 +357,32 @@ class WalkForwardBacktester:
             'entry_date': date,
             'entry_price': risk_eval['entry_price'],
             'entry_price_inc_fee': risk_eval['entry_price_inc_fee'],
+            'cost_per_share': risk_eval['entry_price'],
             'lots': risk_eval['allocated_lots'],
             'shares': risk_eval['allocated_lots'] * 100,
             'capital_spent': capital_needed,
             'tp_price': risk_eval['suggested_take_profit'],
             'sl_price': risk_eval['suggested_stop_loss'],
             'days_held': 0,
-            'is_strong_uptrend': is_strong_uptrend
+            'is_strong_uptrend': is_strong_uptrend,
+            'is_bear_swing': is_bear_swing,
+            'regime_mode': risk_eval.get('regime_mode', 'normal'),
+            'pyramid_count': 0,
+            'pyramid_adds': []
         }
         
         self.active_trades.append(trade)
         total_equity = self.current_capital + capital_needed
-        regime_tag = "[STRONG UPTREND]" if is_strong_uptrend else "[NORMAL]"
-        print(f"  [BUY LOG]  {date.date()} | Beli {regime_tag:<16} @ Rp{trade['entry_price']:<7,.2f} | Lot: {trade['lots']:<4} | Modal : Rp{capital_needed:>10,.2f}            | Ekuitas: Rp{total_equity:>12,.2f}")
-        print(f"       |->  [REASON] Dip: {preds['return']*100:.2f}% | Slope: {preds['trend_slope']:.4f} | Ret: {preds['return']*100:.2f}% | Risk: {preds['risk']*100:.2f}% | RR: {risk_eval['actual_rr_ratio']:.2f} | Dip: {preds['is_dip']*100:.2f}%")
-        print(f"       |->  [TARGET] TP: {trade['tp_price']:<7,.2f} | SL: {trade['sl_price']:<7,.2f}")
+        if is_bear_swing:
+            regime_tag = "[BEAR SWING]"
+        elif is_strong_uptrend:
+            regime_tag = "[STRONG UPTREND]"
+        else:
+            regime_tag = "[NORMAL]"
+        print(f"  [BUY LOG]      {date.date()} | Beli {regime_tag:<16} @ Rp{trade['entry_price']:<7,.2f} | Lot: {trade['lots']:<4} | Avg Entry: Rp{trade['entry_price']*1.0015:<7,.2f}")
+        print(f"       |->  [STATUS]     Invested: Rp{capital_needed:>11,.2f} | P&L: Rp{0.0:>11,.2f} ( +0.00%) | Trading Balance: Rp{self.current_capital:>11,.2f} | Total Equity: Rp{total_equity:>11,.2f}")
+        print(f"       |->  [REASON]     Dip: {preds['return']*100:.2f}% | Slope: {preds['trend_slope']:.4f} | Ret: {preds['return']*100:.2f}% | Risk: {preds['risk']*100:.2f}% | RR: {risk_eval['actual_rr_ratio']:.2f} | Dip: {preds['is_dip']*100:.2f}%")
+        print(f"       |->  [TARGET]     TP: {trade['tp_price']:<7,.2f} | SL: {trade['sl_price']:<7,.2f}")
 
     def _process_active_exits(self, current_date, df_raw_prices: pd.DataFrame, force_close: bool = False, regime_series: int = 2):
         """Mengevaluasi Hard-Exit (TP, SL, MA Crossover, Time-Stop) pada akhir hari bursa"""
@@ -291,8 +403,13 @@ class WalkForwardBacktester:
             if not force_close and not is_entry_day:
                 trade['days_held'] += 1
             
-            # Upgrade ke strong uptrend jika pasar hari ini terkonfirmasi regime 1
+            # Upgrade ke strong uptrend jika:
+            # 1. Pasar hari ini terkonfirmasi regime 1 (Uptrend)
+            # 2. Posisi swing trade berhasil mencetak Golden Cross EMA 5 > EMA 10 (riding rally baru)
             if regime_series == 1:
+                trade['is_strong_uptrend'] = True
+            elif trade.get('is_bear_swing', False) and ma5_curr is not None and ma10_curr is not None and ma5_curr > ma10_curr:
+                trade['had_golden_cross'] = True
                 trade['is_strong_uptrend'] = True
 
             in_strong_uptrend = trade.get('is_strong_uptrend', False)
@@ -315,7 +432,9 @@ class WalkForwardBacktester:
             else:
                 hit_tp = high_price >= trade['tp_price']
                 hit_sl = low_price <= trade['sl_price']
-                hit_time_stop = trade['days_held'] >= self.max_holding_days
+                # Swing trade holding limit: 5 hari jika belum golden cross
+                max_hold = 5 if trade.get('is_bear_swing', False) else self.max_holding_days
+                hit_time_stop = trade['days_held'] >= max_hold
 
             if hit_tp or hit_sl or hit_time_stop or hit_ma_cross or force_close:
                 # Penentuan Harga Jual Realistis
@@ -363,13 +482,126 @@ class WalkForwardBacktester:
                     'days_held': trade['days_held'],
                     'exit_reason': exit_reason,
                     'tp_price': trade['tp_price'],
-                    'sl_price': trade['sl_price']
+                    'sl_price': trade['sl_price'],
+                    'pyramid_count': trade.get('pyramid_count', 0),
+                    'pyramid_adds': trade.get('pyramid_adds', [])
                 }
                 
                 self.trade_history.append(log_entry)
                 self.active_trades.remove(trade)
 
-                print(f"  [SELL LOG] {current_date.date()} | Jual ({exit_reason:<16}) @ Rp{exit_price:<7,.2f} | Lot: {trade['lots']:<4} | Profit: Rp{net_profit:>10,.2f} ({roi_pct:>+6.2f}%) | Ekuitas: Rp{total_equity:>12,.2f}\n")
+                # Update cooldown tracker jika ini adalah swing trade
+                if trade.get('is_bear_swing', False):
+                    self.last_swing_exit_date = current_date
+
+                pyramid_tag = f" [PYRAMID x{trade.get('pyramid_count', 0)}]" if trade.get('pyramid_count', 0) > 0 else ""
+                swing_tag = " [SWING]" if trade.get('is_bear_swing', False) else ""
+                tag = pyramid_tag if pyramid_tag else swing_tag
+                print(f"  [SELL LOG]     {current_date.date()} | Jual ({exit_reason:<16}){tag:<15} @ Rp{exit_price:<7,.2f} | Lot: {trade['lots']:<4}")
+                print(f"       |->  [STATUS]     Invested: Rp{trade['capital_spent']:>11,.2f} | P&L: Rp{net_profit:>+11,.2f} ({roi_pct:>+6.2f}%) | Trading Balance: Rp{self.current_capital:>11,.2f} | Total Equity: Rp{total_equity:>11,.2f}\n")
+
+    def _detect_rule_based_swing(self, current_date, df_raw_prices: pd.DataFrame, current_regime: int) -> dict:
+        """
+        Precision Wave Bottom Detector — Lapisan kedua untuk menangkap dasar gelombang di bear market.
+        
+        Prinsip Utama:
+        1. Jangan pernah beli saat pisau jatuh (falling knife) — kemarin HARUS candle hijau pembalikan!
+        2. Jangan pernah mengejar harga yang sudah melonjak terlalu jauh dari dasar (> 18% di atas low 3 hari).
+        3. RSI kemarin harus masih dalam zona akumulasi/recovering (<= 46), bukan sudah overbought (> 50).
+        4. Support bertahan (Higher Low): Low kemarin tidak menembus titik terendah 10 hari sebelumnya.
+        5. Momentum MACD mulai membaik (MACD Histogram kemarin > 2 hari lalu).
+        6. Stop Loss diletakkan di bawah retest low kemarin (bukan persentase sembarangan).
+        
+        Returns:
+            dict: {
+                "is_swing": bool,
+                "sl_price": float or None,
+                "tp_price": float or None
+            }
+        """
+        null_res = {"is_swing": False, "sl_price": None, "tp_price": None}
+        
+        if current_date not in df_raw_prices.index:
+            return null_res
+        
+        idx = df_raw_prices.index.get_loc(current_date)
+        if idx < 50:
+            return null_res
+            
+        current_open = df_raw_prices.loc[current_date, 'Open']
+        yesterday = df_raw_prices.iloc[idx - 1]
+        prev_day = df_raw_prices.iloc[idx - 2]
+        
+        y_close = yesterday['Close']
+        y_open = yesterday['Open']
+        y_low = yesterday['Low']
+        
+        y_ema5 = self.ma5_series.iloc[idx - 1] if self.ma5_series is not None else y_close
+        y_ema10 = self.ma10_series.iloc[idx - 1] if self.ma10_series is not None else y_close
+        y_ema20 = self.ma20_series.iloc[idx - 1] if self.ma20_series is not None else y_close
+        
+        # 1. Regime condition:
+        # Established downtrend (regime 3) ATAU Deep Crash Reversal (DD50 <= -35% dan EMA5 < EMA10 < EMA20)
+        # Menangkap crash bear market 2026 tanpa tertipu noise sideways 2024-2025
+        is_established_downtrend = (current_regime == 3)
+        high_50d = df_raw_prices['High'].iloc[max(0, idx-51):idx].max()
+        dd_50d = (y_close - high_50d) / (high_50d + 1e-9)
+        is_deep_crash = (dd_50d <= -0.35) and (y_ema5 < y_ema10) and (y_ema10 < y_ema20)
+        
+        if not (is_established_downtrend or is_deep_crash):
+            return null_res
+        
+        # 1. Precondition: RSI dalam 8 hari terakhir sempat menyentuh oversold (< 38)
+        if self.rsi_series is None or current_date not in self.rsi_series.index:
+            return null_res
+            
+        rsi_8d_min = self.rsi_series.iloc[max(0, idx-9):idx].min()
+        if pd.isna(rsi_8d_min) or rsi_8d_min >= 38:
+            return null_res
+            
+        # 2. Anti-Chasing Filter 1: RSI kemarin harus masih <= 46 (belum overbought / overextended)
+        rsi_yesterday = self.rsi_series.iloc[idx - 1]
+        if pd.isna(rsi_yesterday) or rsi_yesterday > 46:
+            return null_res
+            
+        # 3. Confirmation Candle: Kemarin candle hijau & tembus ke atas EMA5
+        y_ema5 = self.ma5_series.iloc[idx - 1] if self.ma5_series is not None else y_close
+        is_green_reversal = (y_close > y_open) and (y_close > prev_day['Close']) and (y_close >= y_ema5)
+        if not is_green_reversal:
+            return null_res
+            
+        # 4. Anti-Chasing Filter 2: Open hari ini tidak boleh > 18% di atas low 3 hari terakhir
+        recent_low_3d = df_raw_prices['Low'].iloc[max(0, idx-4):idx].min()
+        chase_pct = (current_open - recent_low_3d) / (recent_low_3d + 1e-9)
+        if chase_pct > 0.18:
+            return null_res
+            
+        # 5. Higher Low / Support Defense:
+        # Low kemarin tidak boleh jebol low 10 hari sebelumnya
+        prior_low_10d = df_raw_prices['Low'].iloc[max(0, idx-11):idx-1].min()
+        if y_low < (prior_low_10d * 0.99):
+            return null_res
+            
+        # 6. Momentum MACD membaik
+        if self.macd_hist_series is not None:
+            y_macd = self.macd_hist_series.iloc[idx - 1]
+            prev_macd = self.macd_hist_series.iloc[idx - 2]
+            if y_macd <= prev_macd:
+                return null_res
+                
+        # 7. Structural SL & TP
+        sl_price = float(round(y_low * 0.96))  # 4% di bawah retest low kemarin
+        risk_pct = (current_open - sl_price) / current_open
+        if not (0.02 <= risk_pct <= 0.10):
+            return null_res
+            
+        tp_price = float(round(current_open * (1 + max(0.08, risk_pct * 1.8))))
+        
+        return {
+            "is_swing": True,
+            "sl_price": sl_price,
+            "tp_price": tp_price
+        }
 
     def _retrain_models(self, X_train: pd.DataFrame, y_train_dict):
         """
@@ -478,6 +710,17 @@ class WalkForwardBacktester:
                 journal.at[entry_d, 'Lot'] = trade['lots']
                 journal.at[entry_d, 'Value Transaksi'] = trade['capital_spent']
                 
+            for add in trade.get('pyramid_adds', []):
+                add_d = add['date']
+                if add_d in journal.index:
+                    if journal.at[add_d, 'Keputusan'] == '-':
+                        journal.at[add_d, 'Keputusan'] = 'Pyramid Buy'
+                    else:
+                        journal.at[add_d, 'Keputusan'] += ' & Pyramid Buy'
+                    journal.at[add_d, 'Harga Eksekusi'] = add['price']
+                    journal.at[add_d, 'Lot'] = add['lots']
+                    journal.at[add_d, 'Value Transaksi'] = add['capital']
+
             exit_d = trade['exit_date']
             if exit_d in journal.index:
                 if journal.at[exit_d, 'Keputusan'] == '-':
@@ -499,6 +742,17 @@ class WalkForwardBacktester:
                 journal.at[entry_d, 'Harga Eksekusi'] = trade['entry_price']
                 journal.at[entry_d, 'Lot'] = trade['lots']
                 journal.at[entry_d, 'Value Transaksi'] = trade['capital_spent']
+
+            for add in trade.get('pyramid_adds', []):
+                add_d = add['date']
+                if add_d in journal.index:
+                    if journal.at[add_d, 'Keputusan'] == '-':
+                        journal.at[add_d, 'Keputusan'] = 'Pyramid Buy'
+                    else:
+                        journal.at[add_d, 'Keputusan'] += ' & Pyramid Buy'
+                    journal.at[add_d, 'Harga Eksekusi'] = add['price']
+                    journal.at[add_d, 'Lot'] = add['lots']
+                    journal.at[add_d, 'Value Transaksi'] = add['capital']
                 
         # Forward fill equity if any NaN
         journal['Invested'] = journal['Invested'].ffill()

@@ -37,7 +37,10 @@ def evaluate_trade_risk(
     max_allocation_percentage: float,
     fee_buy: float = 0.0015,
     fee_sell: float = 0.0025,
-    regime_series: int = 2
+    regime_series: int = 2,
+    rule_based_swing: bool = False,
+    swing_sl_price: float = None,
+    swing_tp_price: float = None
 ) -> Dict[str, Any]:
     """
     Sistem Manajemen Risiko Kuantitatif Profesional.
@@ -57,19 +60,38 @@ def evaluate_trade_risk(
     - fee_buy (float): Persentase biaya beli aplikasi (default: 0.15% = 0.0015).
     - fee_sell (float): Persentase biaya jual aplikasi (default: 0.25% = 0.0025).
     - regime_series (int): Status apakah pasar saat ini dalam kondisi uptrend, sideways, atau downtrend.
+      1 = Strong Uptrend, 2 = Sideways, 3 = Downtrend, 4 = Bear Bounce.
+    - rule_based_swing (bool): True jika Rule-Based Swing Detector mendeteksi kondisi reversal.
+    - swing_sl_price (float): Level harga Stop Loss struktural (retest low).
+    - swing_tp_price (float): Level harga Take Profit struktural.
     """
     # Penentuan batas minimum slope berdasarkan regime
+    regime_mode = "normal"  # Track regime mode untuk logging
     if regime_series == 1:  # Uptrend
         min_trend_slope = 0.0
         min_dip_proba = max(0.1, min_dip_proba - 0.10)
+        regime_mode = "uptrend"
     elif regime_series == 2:  # Sideways
         min_trend_slope = 0.008
+        regime_mode = "sideways"
     else:  # Downtrend
         min_trend_slope = 0.015
+        regime_mode = "downtrend"
+
+    # Override sizing untuk Precision Swing Trade
+    if rule_based_swing:
+        regime_mode = "bear_swing"
+        max_allocation_percentage = min(max_allocation_percentage, 0.30)  # Cap 30% alokasi
+        max_risk_percentage = min(max_risk_percentage, 0.03)  # Cap 3% risiko per trade
 
     # 1. Konversi prediksi persentase menjadi level harga nominal target
-    raw_tp = entry_price * (1 + pred_return)
-    raw_sl = entry_price * (1 + pred_risk)  # pred_risk negatif, misal 1 + (-0.03) = 0.97
+    # Jika ada level SL/TP struktural dari rule-based swing, prioritaskan itu
+    if rule_based_swing and swing_sl_price is not None and swing_sl_price > 0:
+        raw_sl = swing_sl_price
+        raw_tp = swing_tp_price if (swing_tp_price is not None and swing_tp_price > 0) else entry_price * 1.12
+    else:
+        raw_tp = entry_price * (1 + pred_return)
+        raw_sl = entry_price * (1 + pred_risk)  # pred_risk negatif, misal 1 + (-0.03) = 0.97
     
     expected_tp_price = float(round_to_idx_tick(raw_tp))
     expected_sl_price = float(round_to_idx_tick(raw_sl))
@@ -83,7 +105,20 @@ def evaluate_trade_risk(
     actual_reward = net_tp_per_share - cost_buy_per_share
     actual_risk = cost_buy_per_share - net_sl_per_share
     if actual_risk <= 0:
-        actual_risk = 0.01 
+        # Reject trade: stop >= entry merupakan kondisi invalid (audit Section XI.C)
+        return {
+            "execute_trade": False,
+            "raw_buy_signal": False,
+            "entry_price": round(entry_price, 2),
+            "entry_price_inc_fee": round(cost_buy_per_share, 2),
+            "suggested_take_profit": round(expected_tp_price, 2),
+            "suggested_stop_loss": round(expected_sl_price, 2),
+            "actual_rr_ratio": 0.0,
+            "allocated_lots": 0,
+            "capital_spent_idr": 0.0,
+            "regime_mode": regime_mode,
+            "reject_reason": "INVALID_RISK_DISTANCE"
+        }
     actual_rr_ratio = actual_reward / actual_risk
     
     # 4. Engine Ukuran Posisi (Position Sizing) - Best Practice Manajemen Risiko
@@ -103,10 +138,27 @@ def evaluate_trade_risk(
         
     final_capital_spent = final_lots_to_buy * 100 * cost_buy_per_share
     
-    # 5. Filter Keputusan Eksekusi Transaksi Berlapislah
+    # 5. Filter Keputusan Eksekusi Transaksi Berlapis
     # Sinyal mentah (Debug Only): Hanya bergantung pada model murni (tanpa batasan lot/modal)
     raw_buy_signal = (pred_is_dip >= min_dip_proba) or (pred_trend_slope >= min_trend_slope) or (actual_rr_ratio >= min_rr_ratio)
-    act_buy_signal = (pred_is_dip >= min_dip_proba) or ((pred_trend_slope >= min_trend_slope) and (actual_rr_ratio >= min_rr_ratio))
+    
+    # Jalur sinyal utama ML-based
+    ml_buy_signal = (pred_is_dip >= min_dip_proba) or ((pred_trend_slope >= min_trend_slope) and (actual_rr_ratio >= min_rr_ratio))
+    
+    # Jalur sinyal Rule-Based Swing Detector (lapisan kedua)
+    # Aktif sebagai fallback presisi jika ML tidak menangkap posisi bagus di bear market
+    # ML harus konfirmasi minimal +5% MFE upside (Sec. XII: layered decision, jangan bypass risk framework)
+    swing_buy_signal = bool(rule_based_swing and (actual_risk > 0) and (pred_return >= 0.05))
+    
+    # Gabungan: ML sinyal OR rule-based swing
+    act_buy_signal = ml_buy_signal or swing_buy_signal
+    
+    # Override sizing untuk swing trade: cap allocation 30%
+    if swing_buy_signal and not ml_buy_signal:
+        max_capital_allocation_swing = total_capital * 0.30
+        if final_capital_spent > max_capital_allocation_swing:
+            final_lots_to_buy = math.floor(max_capital_allocation_swing / (100 * cost_buy_per_share))
+            final_capital_spent = final_lots_to_buy * 100 * cost_buy_per_share
     
     execute_trade = act_buy_signal and (final_lots_to_buy > 0)
   
@@ -119,7 +171,9 @@ def evaluate_trade_risk(
         "suggested_stop_loss": round(expected_sl_price, 2),
         "actual_rr_ratio": round(actual_rr_ratio, 2),
         "allocated_lots": final_lots_to_buy,
-        "capital_spent_idr": round(final_capital_spent, 2)
+        "capital_spent_idr": round(final_capital_spent, 2),
+        "regime_mode": regime_mode,
+        "swing_triggered": swing_buy_signal and not ml_buy_signal
     }
 
 

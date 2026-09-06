@@ -165,11 +165,15 @@ def plot_interactive_candlestick(
                 y_pos = row['entry_price'] * 0.95
             buy_y.append(y_pos)
             
+            pyr_cnt = row.get('pyramid_count', 0)
+            lot_label = f"{row['lots']} (Termasuk {pyr_cnt}x Pyramid)" if pyr_cnt > 0 else f"{row['lots']}"
+            price_label = f"Avg Entry: Rp{row['entry_price']:,.2f}" if pyr_cnt > 0 else f"Harga: Rp{row['entry_price']:,.2f}"
+            
             text = (f"ID Transaksi: {row.get('trade_id', '')}<br>"
                     f"Beli: {d.strftime('%Y-%m-%d')}<br>"
-                    f"Harga: Rp{row['entry_price']:,.2f}<br>"
-                    f"Lot: {row['lots']}<br>"
-                    f"Value: Rp{row.get('capital_spent', 0):,.2f}<br>"
+                    f"{price_label}<br>"
+                    f"Lot: {lot_label}<br>"
+                    f"Total Modal: Rp{row.get('capital_spent', 0):,.2f}<br>"
                     f"TP: Rp{row.get('tp_price', 0):,.2f}<br>"
                     f"SL: Rp{row.get('sl_price', 0):,.2f}")
             buy_hover.append(text)
@@ -185,6 +189,36 @@ def plot_interactive_candlestick(
                 hovertemplate='%{text}<extra></extra>'
             ), row=1, col=1, secondary_y=False)
 
+        # --- Plot Pyramiding Add Signals (Oranye) ---
+        pyr_dates = []
+        pyr_prices = []
+        pyr_hover = []
+        for idx, row in df_trds.iterrows():
+            adds = row.get('pyramid_adds', [])
+            if isinstance(adds, list) and len(adds) > 0:
+                for i, add in enumerate(adds):
+                    d_add = pd.to_datetime(add['date'])
+                    if d_add in df.index:
+                        pyr_dates.append(d_add)
+                        pyr_prices.append(df.loc[d_add, 'Low'] * 0.95)
+                        text = (f"ID Transaksi: {row.get('trade_id', '')} [Pyramid Add #{i+1}]<br>"
+                                f"Tanggal: {d_add.strftime('%Y-%m-%d')}<br>"
+                                f"Harga Tambah: Rp{add['price']:,.2f}<br>"
+                                f"Tambah Lot: +{add['lots']}<br>"
+                                f"Modal Tambahan: Rp{add['capital']:,.2f}")
+                        pyr_hover.append(text)
+
+        if pyr_dates:
+            fig.add_trace(go.Scatter(
+                x=pyr_dates,
+                y=pyr_prices,
+                mode='markers',
+                marker=dict(symbol='triangle-up', color='#FF9800', size=11, line=dict(width=1, color='#E65100')),
+                name='Pyramid Add (Oranye)',
+                text=pyr_hover,
+                hovertemplate='%{text}<extra></extra>'
+            ), row=1, col=1, secondary_y=False)
+
         # --- Plot Sell Signals ---
         df_trds_sell = df_trds[df_trds['exit_date'].isin(df.index)]
         sell_y = []
@@ -197,10 +231,13 @@ def plot_interactive_candlestick(
                 y_pos = row['exit_price'] * 1.05
             sell_y.append(y_pos)
             
+            pyr_cnt = row.get('pyramid_count', 0)
+            lot_label = f"{row['lots']} (Termasuk {pyr_cnt}x Pyramid)" if pyr_cnt > 0 else f"{row['lots']}"
+            
             text = (f"ID Pembelian: {row.get('trade_id', '')}<br>"
                     f"Jual: {d.strftime('%Y-%m-%d')}<br>"
                     f"Harga: Rp{row['exit_price']:,.2f}<br>"
-                    f"Lot: {row['lots']}<br>"
+                    f"Lot: {lot_label}<br>"
                     f"Alasan Jual: {row['exit_reason']}<br>"
                     f"Profit: Rp{row['net_profit']:,.2f} ({row['roi_pct']:+.2f}%)")
             sell_hover.append(text)
@@ -223,17 +260,30 @@ def plot_interactive_candlestick(
             df_eqty = df_eqty.set_index('date')
         df_eqty.index = pd.to_datetime(df_eqty.index)
         df_eqty = df_eqty.reindex(df.index)
+        
+        # Plot Total Equity Portofolio (Kas + Nilai Saham Aktif)
+        if 'total_equity' in df_eqty.columns:
+            df_eqty['total_equity'] = df_eqty['total_equity'].ffill()
+            fig.add_trace(go.Scatter(
+                x=df_eqty.index, 
+                y=df_eqty['total_equity'], 
+                mode='lines', 
+                line=dict(color='#2E7D32', width=2),
+                name='Total Portofolio Equity (Rp)'
+            ), row=2, col=1)
+
+        # Plot Sisa Kas Tunai
         if 'cash' in df_eqty.columns:
-            # Isi ffill untuk mengisi hari-hari di mana tidak ada record transaksi tapi cash tetap
             df_eqty['cash'] = df_eqty['cash'].ffill()
             fig.add_trace(go.Scatter(
                 x=df_eqty.index, 
                 y=df_eqty['cash'], 
                 mode='lines', 
-                line=dict(color='royalblue', width=2),
-                name='Total Cash (Rp)'
+                line=dict(color='royalblue', width=1.5, dash='dot'),
+                name='Sisa Kas Tunai (Rp)'
             ), row=2, col=1)
-            fig.update_yaxes(title_text="Equity (Rp)", row=2, col=1)
+            
+        fig.update_yaxes(title_text="Equity (Rp)", row=2, col=1)
 
     # Volume (Warna hijau jika harga naik, merah jika turun)
     colors = ['green' if close >= open else 'red' for close, open in zip(df['Close'], df['Open'])]
