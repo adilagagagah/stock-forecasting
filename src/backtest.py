@@ -22,7 +22,8 @@ class WalkForwardBacktester:
         ma_type: str = 'ema',
         enable_pyramiding: bool = True,
         max_pyramid_adds: int = 2,
-        pyramid_profit_threshold: float = 0.05
+        pyramid_profit_threshold: float = 0.05,
+        cross_cooldown_days: int = 5
     ):
         """
         Mesin Backtest Walk-Forward Analysis (WFA) berbasis Expanding Window.
@@ -40,6 +41,7 @@ class WalkForwardBacktester:
         - enable_pyramiding : Mengaktifkan penambahan posisi saat tren terkonfirmasi (default: True)
         - max_pyramid_adds : Maksimum penambahan posisi per transaksi aktif (default: 2)
         - pyramid_profit_threshold : Keuntungan minimum sebelum boleh pyramiding (default: +5%)
+        - cross_cooldown_days : Hari bursa jeda (cooldown) pasca exit MA Cross sebelum boleh entri baru (default: 5)
         """
         self.ticker = ticker
         self.min_dip_proba = min_dip_proba
@@ -54,6 +56,7 @@ class WalkForwardBacktester:
         self.enable_pyramiding = enable_pyramiding
         self.max_pyramid_adds = max_pyramid_adds
         self.pyramid_profit_threshold = pyramid_profit_threshold
+        self.cross_cooldown_days = cross_cooldown_days
         self.ma5_series = None
         self.ma10_series = None
 
@@ -73,6 +76,7 @@ class WalkForwardBacktester:
         self.ma20_series = None      # EMA 20
         self.ma50_series = None      # EMA 50
         self.last_swing_exit_date = None  # Cooldown tracker: tanggal terakhir keluar dari swing trade
+        self.last_cross_exit_date = None  # Cooldown tracker: tanggal terakhir keluar dari MA Cross exit
 
     def run_backtest(
         self, 
@@ -93,6 +97,7 @@ class WalkForwardBacktester:
         self.equity_curve = []
         self.daily_predictions = []
         self.last_swing_exit_date = None
+        self.last_cross_exit_date = None
 
         print("=" * 70)
         print(f" MEMULAI SIMULASI WALK-FORWARD ANALYSIS ({self.ticker})")
@@ -203,6 +208,13 @@ class WalkForwardBacktester:
                     if days_since_swing_exit < 5:
                         swing_info = {"is_swing": False, "sl_price": None, "tp_price": None}
                 
+                # Cooldown Pasca Death Cross MA (Skenario 2): blokir entri baru selama N hari bursa setelah exit MA Cross
+                blocked_by_cross_cooldown = False
+                if self.cross_cooldown_days > 0 and self.last_cross_exit_date is not None:
+                    days_since_cross = len(df_raw_prices.loc[self.last_cross_exit_date:current_date]) - 1
+                    if days_since_cross < self.cross_cooldown_days:
+                        blocked_by_cross_cooldown = True
+                
                 risk_eval = evaluate_trade_risk(
                     total_capital=self.current_capital,
                     entry_price=entry_price_today,
@@ -221,6 +233,9 @@ class WalkForwardBacktester:
                     swing_sl_price=swing_info['sl_price'],
                     swing_tp_price=swing_info['tp_price']
                 )
+
+                if blocked_by_cross_cooldown:
+                    risk_eval['execute_trade'] = False
 
                 # C2. Entry atau Pyramiding : EXECUTION ENGINE (OPENING)
                 if risk_eval['execute_trade']:
@@ -493,6 +508,10 @@ class WalkForwardBacktester:
                 # Update cooldown tracker jika ini adalah swing trade
                 if trade.get('is_bear_swing', False):
                     self.last_swing_exit_date = current_date
+
+                # Update cooldown tracker jika exit disebabkan oleh MA Cross
+                if "Cross" in exit_reason:
+                    self.last_cross_exit_date = current_date
 
                 pyramid_tag = f" [PYRAMID x{trade.get('pyramid_count', 0)}]" if trade.get('pyramid_count', 0) > 0 else ""
                 swing_tag = " [SWING]" if trade.get('is_bear_swing', False) else ""
